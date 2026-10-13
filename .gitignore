@@ -11,3 +11,11 @@ logs/
 *.env
 credentials*
 *token*
+
+# Exports hold the full text of every job step command, which can hold passwords.
+jobs.csv
+steps.csv
+history.csv
+activity.csv
+stepflow.txt
+.coverage

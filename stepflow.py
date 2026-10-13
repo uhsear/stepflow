@@ -14,8 +14,9 @@ edited in its dialog, but a T-SQL edit gets no warning. A community script
 from 2012 finds steps that nothing routes to, one hop deep. dbachecks compares
 a running job with its average duration over a live connection. This tool
 reads exported msdb rows offline, walks the whole step graph from the start
-step, resolves every job named in a step command, and times each finished or
-running run against the median of the job's other successful runs.
+step, resolves every job that a string literal in a step command names, and
+times each finished or running run against the median of the job's other
+successful runs.
 
     python stepflow.py --self-test
     python stepflow.py --sql steps > steps.sql
@@ -23,7 +24,8 @@ running run against the median of the job's other successful runs.
     python stepflow.py --jobs jobs.csv --history history.csv --activity activity.csv
     python stepflow.py --jobs jobs.csv --steps steps.csv --report out.txt --apply
 
-Nothing is written without --apply. Nothing connects to a server.
+Nothing is written without --apply, except that --self-test writes fixtures
+to a temporary directory and removes it. Nothing connects to a server.
 
 Exit codes: 0 no finding fails the gate, 1 at least one does, 2 an export
 could not be read or is malformed, 64 usage error.
@@ -32,6 +34,8 @@ could not be read or is malformed, 64 usage error.
 from __future__ import print_function
 
 import argparse
+import atexit
+import bisect
 import contextlib
 import csv
 import datetime
@@ -209,6 +213,16 @@ class Report(object):
 
 # ------------------------------------------------------------- the decisions
 
+def clip(value, width=32):
+    """repr(value) cut to width characters, for an error message.
+
+    A misaligned export puts other columns into the cell an error names, and
+    that text must not be copied whole into a log.
+    """
+    text = repr(value)
+    return text if len(text) <= width else text[:width - 4] + "...'"
+
+
 def decode_duration(value):
     """Seconds from a run_duration: HHMMSS, and the hours can pass 99."""
     if value < 0:
@@ -228,7 +242,7 @@ def run_start(run_date, run_time):
     minute, second = divmod(minute_second, 100)
     try:
         return datetime.datetime(year, month, day, hour, minute, second)
-    except ValueError:
+    except (ValueError, OverflowError):
         raise ValueError("run_date %d with run_time %d is not a date and time"
                          % (run_date, run_time))
 
@@ -343,7 +357,7 @@ def analyse_flow(job, steps):
                 "FAIL_REPORTS_SUCCESS", job.name,
                 "when step %d (%s) fails, the job quits reporting success."
                 % (sid, step.name)))
-            continue
+        # A quit has no target, so the check below cannot fire for it.
         target = target_of(step, step.on_fail_action, step.on_fail_step_id)
         if target in by_id and can_end_green(by_id, target):
             findings.append(Finding(
@@ -354,24 +368,89 @@ def analyse_flow(job, steps):
     return findings
 
 
-# Matches a T-SQL string literal, N'...' or '...', with '' as an escaped quote.
-_LITERAL = r"N?'((?:[^']|'')*)'"
-_NAME_ARG = re.compile(r"@job_name\s*=\s*" + _LITERAL, re.I)
-_POSITIONAL = re.compile(r"\bsp_(?:start|stop)_job\s+" + _LITERAL, re.I)
-_NAME_FILTER = re.compile(r"\bname\s*(=|like)\s*" + _LITERAL, re.I)
-_ID_ARG = re.compile(r"@job_id\s*=\s*N?'?\{?([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}"
-                     r"[0-9a-f]{12})\}?'?", re.I)
-_SYSJOBS = re.compile(r"\bsysjobs\b|\bsysjobs_view\b", re.I)
+# Every string literal is cut out of the command first and replaced by a
+# marker, \x01 and its number, and every comment is dropped. The patterns then
+# run over the code only. A name inside a comment, or inside a string that is
+# dynamic SQL or a PRINT, is not a binding. A literal that is followed by + is
+# the start of a name built at run time, so it is not a name either.
+_TOKEN = re.compile(r"'(?:[^']|'')*'|--[^\r\n]*|/\*")
+_LIT = r"N?\x01(\d+)\x01(?!\s*\+)"
+_NAME_ARG = re.compile(r"@job_name\s*=\s*" + _LIT, re.I)
+_POSITIONAL = re.compile(r"\bsp_(?:start|stop)_job\s+" + _LIT, re.I)
+_NAME_FILTER = re.compile(
+    r"(?<![@\w.\]])((?:\[?\w+\]?\s*\.\s*)*)\[?name\]?\s*(=|like)\s*" + _LIT,
+    re.I)
+_ID_ARG = re.compile(r"@job_id\s*=\s*N?\x01(\d+)\x01", re.I)
+_GUID_LIT = re.compile(r"\A\{?([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\}?\Z",
+                       re.I)
+_SYSJOBS = re.compile(r"\[?\bsysjobs(?:_view)?\b\]?(?:\s+(?:as\s+)?(\w+))?", re.I)
+_SOURCE = re.compile(r"\b(?:from|join)\s+(?:\[?\w+\]?\s*\.\s*)*\[?(\w+)", re.I)
+_PROC = re.compile(r"\bsp_\w+", re.I)
+_NOT_EXISTS = re.compile(r"\bnot\s+exists\s*\(", re.I)
+_NOT_ALIAS = frozenset(("where", "join", "inner", "left", "right", "full",
+                        "cross", "outer", "on", "with", "set", "group",
+                        "order", "union", "having", "option", "for", "as"))
+
+
+def _skeleton(text):
+    """(code, literals): text without comments, with literals cut out."""
+    text = text.replace("\x01", " ")
+    out = []
+    literals = []
+    pos = 0
+    while True:
+        match = _TOKEN.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            return "".join(out), literals
+        out.append(text[pos:match.start()])
+        pos = match.end()
+        token = match.group()
+        if token[0] == "'":
+            literals.append(token[1:-1])
+            out.append("\x01%d\x01" % (len(literals) - 1))
+        else:
+            out.append(" ")
+        if token == "/*":
+            # Block comments nest in T-SQL. An unclosed one runs to the end.
+            depth = 1
+            while depth and pos < len(text):
+                if text.startswith("/*", pos):
+                    depth += 1
+                    pos += 2
+                elif text.startswith("*/", pos):
+                    depth -= 1
+                    pos += 2
+                else:
+                    pos += 1
+
+
+def _inside_not_exists(code, pos):
+    """True when pos is inside the parentheses of a NOT EXISTS (...)."""
+    for match in _NOT_EXISTS.finditer(code, 0, pos):
+        depth = 1
+        for char in code[match.end():pos]:
+            depth += (char == "(") - (char == ")")
+            if depth == 0:
+                break
+        else:
+            return True
+    return False
 
 
 def job_references(text):
     """The jobs a command names, as (kind, value) pairs in first-seen order.
 
     kind is "name", "like" or "id". A name compared in a WHERE clause counts
-    only when the command reads msdb's sysjobs, because "name" is the most
-    common column name there is. A value holding an Agent token such as
-    $(ESCAPE_SQUOTE(JOBNAME)) is resolved at run time, so it is skipped.
+    only when the command reads msdb's sysjobs and the column is sysjobs's
+    own, because "name" is the most common column name there is: j.name counts
+    when j is an alias of sysjobs, and a bare name counts when sysjobs is the
+    only table read. A value holding an Agent token such as
+    $(ESCAPE_SQUOTE(JOBNAME)) is resolved at run time, so it is skipped. So is
+    the name that sp_add_job gives a new job, and a name looked up inside a
+    NOT EXISTS: both expect the job to be absent.
     """
+    code, literals = _skeleton(text)
     found = []
 
     def add(kind, value):
@@ -381,16 +460,33 @@ def job_references(text):
         if (kind, value) not in found:
             found.append((kind, value))
 
-    for match in _NAME_ARG.finditer(text):
-        add("name", match.group(1))
-    for match in _POSITIONAL.finditer(text):
-        add("name", match.group(1))
-    if _SYSJOBS.search(text):
-        for match in _NAME_FILTER.finditer(text):
-            add("like" if match.group(1).lower() == "like" else "name",
-                match.group(2))
-    for match in _ID_ARG.finditer(text):
-        add("id", match.group(1).lower())
+    for match in _NAME_ARG.finditer(code):
+        procs = _PROC.findall(code, 0, match.start())
+        if procs and procs[-1].lower() == "sp_add_job":
+            continue
+        add("name", literals[int(match.group(1))])
+    for match in _POSITIONAL.finditer(code):
+        add("name", literals[int(match.group(1))])
+    tables = list(_SYSJOBS.finditer(code))
+    if tables:
+        names = set(("sysjobs", "sysjobs_view"))
+        for table in tables:
+            alias = (table.group(1) or "").lower()
+            if alias and alias not in _NOT_ALIAS:
+                names.add(alias)
+        alone = all(m.group(1).lower() in ("sysjobs", "sysjobs_view")
+                    for m in _SOURCE.finditer(code))
+        for match in _NAME_FILTER.finditer(code):
+            prefix = match.group(1).replace("[", "").replace("]", "")
+            qualifier = prefix.rstrip(". ").split(".")[-1].strip().lower()
+            if (qualifier in names if qualifier else alone) and \
+                    not _inside_not_exists(code, match.start()):
+                add("like" if match.group(2).lower() == "like" else "name",
+                    literals[int(match.group(3))])
+    for match in _ID_ARG.finditer(code):
+        guid = _GUID_LIT.match(literals[int(match.group(1))])
+        if guid:
+            add("id", guid.group(1).lower())
     return found
 
 
@@ -420,7 +516,13 @@ def like_regex(pattern):
         else:
             out.append(re.escape(char))
         i += 1
-    return re.compile("".join(out) + r"\Z", re.I | re.S)
+    try:
+        return re.compile("".join(out) + r"\Z", re.I | re.S)
+    except re.error:
+        # [z-a] and [^] are not classes. Exit 2 with the pattern, not a
+        # traceback, which would exit 1 and read as a finding.
+        raise ValueError("the LIKE pattern %s is not a valid character "
+                         "class pattern" % clip(pattern))
 
 
 def resolve(kind, value, jobs):
@@ -489,6 +591,23 @@ def runs_of(rows):
     return runs
 
 
+def median_less(vals, skip):
+    """The median of the sorted list vals without one occurrence of skip.
+
+    skip None leaves vals whole. The same number as statistics.median of the
+    shorter list, without building it: a job with many retained runs would
+    otherwise cost a copy and a sort for every run.
+    """
+    cut = None if skip is None else bisect.bisect_left(vals, skip)
+
+    def at(k):
+        return vals[k + 1] if cut is not None and k >= cut else vals[k]
+
+    count = len(vals) - (cut is not None)
+    mid = count // 2
+    return at(mid) if count % 2 else (at(mid - 1) + at(mid)) / 2
+
+
 def analyse_history(jobs, history, factor=DEFAULT_FACTOR,
                     min_runs=DEFAULT_MIN_RUNS, min_seconds=DEFAULT_MIN_SECONDS,
                     baseline_before=None):
@@ -503,9 +622,11 @@ def analyse_history(jobs, history, factor=DEFAULT_FACTOR,
                 if r[0].run_status != 4]
         pool = [o for o, _ in runs if o.run_status == 1 and (
             baseline_before is None or o.start < baseline_before)]
+        pool_seconds = sorted(o.seconds for o in pool)
+        pool_ids = set(o.instance_id for o in pool)
         if len(pool) >= min_runs:
-            baselines[job.job_id] = (statistics.median(
-                [o.seconds for o in pool]), len(pool))
+            baselines[job.job_id] = (statistics.median(pool_seconds),
+                                     len(pool))
         untimed = 0
         for outcome, step_rows in runs:
             started = outcome.start.strftime("%Y-%m-%d %H:%M:%S")
@@ -517,12 +638,13 @@ def analyse_history(jobs, history, factor=DEFAULT_FACTOR,
                     "failed in it." % (started, ", ".join(
                         str(s.step_id) for s in failed))))
             # The run itself never counts toward its own normal.
-            others = [o.seconds for o in pool
-                      if o.instance_id != outcome.instance_id]
-            if len(others) < min_runs:
+            skip = outcome.seconds if outcome.instance_id in pool_ids \
+                else None
+            others = len(pool_seconds) - (skip is not None)
+            if others < min_runs:
                 untimed += 1
                 continue
-            normal = statistics.median(others)
+            normal = median_less(pool_seconds, skip)
             if outcome.seconds >= min_seconds and \
                     outcome.seconds > factor * normal:
                 ratio = ("%.0fx" % (outcome.seconds / normal) if normal
@@ -532,10 +654,15 @@ def analyse_history(jobs, history, factor=DEFAULT_FACTOR,
                     "the run started %s took %s, %s the median %s of %d "
                     "other successful run(s), and reads as %s."
                     % (started, fmt_seconds(outcome.seconds), ratio,
-                       fmt_seconds(normal), len(others),
+                       fmt_seconds(normal), others,
                        RUN_STATUS.get(outcome.run_status, "status %d"
                                       % outcome.run_status))))
-        if untimed:
+        if not runs:
+            findings.append(Finding(
+                "NO_BASELINE", job.name,
+                "it has no finished run in the history export, so nothing "
+                "was timed."))
+        elif untimed:
             findings.append(Finding(
                 "NO_BASELINE", job.name,
                 "%d run(s) were not timed: fewer than %d other successful "
@@ -585,8 +712,9 @@ def check_tables(jobs, steps, history, activity):
             if row.job_id not in ids:
                 raise ValueError(
                     "the %s export names job id %s, which is not in the jobs "
-                    "export. Take every export at the same time."
-                    % (name, row.job_id))
+                    "export. Take every export at the same time. msdb also "
+                    "keeps the history rows of a job deleted with "
+                    "@delete_history = 0." % (name, row.job_id))
     for step in steps:
         key = (step.job_id, step.step_id)
         if key in keys:
@@ -599,6 +727,14 @@ def build_report(jobs, steps=None, history=None, activity=None,
                  factor=DEFAULT_FACTOR, min_runs=DEFAULT_MIN_RUNS,
                  min_seconds=DEFAULT_MIN_SECONDS, baseline_before=None):
     """Run every check the supplied exports allow. None means not supplied."""
+    if not jobs:
+        raise ValueError("the jobs export has no rows, so nothing was "
+                         "checked. Check the server, the database (msdb) "
+                         "and the permissions of the login that took it.")
+    if activity is not None and not activity:
+        raise ValueError("the activity export has no rows, so no running "
+                         "job could be seen. Check that SQL Server Agent is "
+                         "running and that the export read the right server.")
     check_tables(jobs, steps or [], history or [], activity or [])
     findings = []
     checked = []
@@ -696,6 +832,15 @@ def self_test():
           "run_time 72105 is 07:21:05, the leading zero dropped by an int")
     raises(lambda: run_start(20261332, 0), "a month of 13 is refused")
     raises(lambda: run_start(20261009, 250000), "an hour of 25 is refused")
+    check(decode_duration(5959) == 3599,
+          "run_duration 5959 is 59m 59s: the top of both fields is valid")
+    raises(lambda: run_start(99999999999999999999, 0),
+           "a run_date past a C long is refused, not an OverflowError  "
+           "<-- pinned defect")
+    check(clip("ab") == "'ab'" and len(clip("x" * 100)) == 32 and
+          clip("x" * 100).endswith("...'"),
+          "clip() leaves a short value alone and cuts a long one to 32")
+
     check(fmt_seconds(45) == "45s" and fmt_seconds(360) == "6m 00s" and
           fmt_seconds(11700) == "3h 15m 00s" and fmt_seconds(2.5) == "2s",
           "durations print as h, m and s, rounded to the second")
@@ -814,6 +959,15 @@ def self_test():
                                  fail_id=9)}, 1) is False,
           "a walk that ends at a missing step cannot end green")
 
+    found = analyse_flow(job(start=3), [step(2), step(1)])
+    check(kinds(found) == ["START_MISSING"] and "has steps 1, 2." in
+          found[0].text,
+          "the steps a missing start step leaves are listed in order")
+    found = analyse_flow(job(), [step(1), step(3), step(2)])
+    check([f.text.split()[1] for f in found] == ["2", "3"],
+          "unreachable steps are reported in step order, whatever the "
+          "export order")
+
     # ---- job references in step commands
     refs = job_references(
         "EXEC msdb.dbo.sp_stop_job @job_name = N'nightly load';")
@@ -846,6 +1000,96 @@ def self_test():
     check(job_references("EXEC sp_start_job @job_id = '{%s}'" % gid) ==
           [("id", gid.lower())], "a literal @job_id is read, braces or not")
 
+    check(job_references(
+        "-- retired: EXEC msdb.dbo.sp_stop_job @job_name = N'old nightly';\n"
+        "SELECT 1") == [],
+          "a name in a -- comment is not a binding  <-- pinned defect")
+    check(job_references("/* EXEC sp_stop_job N'old'; */ SELECT 1") == [],
+          "a name in a block comment is not a binding  <-- pinned defect")
+    check(job_references("/* a /* b */ sp_stop_job N'old' */ "
+                         "EXEC sp_stop_job N'live'") == [("name", "live")],
+          "block comments nest, as they do in T-SQL")
+    check(job_references("EXEC sp_stop_job N'a' /* never closed "
+                         "sp_stop_job N'b'") == [("name", "a")],
+          "a block comment that is never closed runs to the end")
+    check(job_references("-- it's here\nEXEC sp_stop_job N'x'") ==
+          [("name", "x")], "an apostrophe in a comment opens no string")
+    check(job_references("EXEC sp_stop_job N'a--b /* c'") ==
+          [("name", "a--b /* c")], "comment marks inside a string stay text")
+    check(job_references("EXEC sp_stop_job N'abc") == [],
+          "a string that is never closed is not a name")
+    check(job_references("EXEC sp_stop_job N'a\x01b'") == [("name", "a b")],
+          "a control character in a command cannot fake a literal marker")
+    check(job_references(
+        "EXEC msdb.dbo.sp_stop_job @job_name = N'Backup - ' + @@SERVERNAME"
+    ) == [], "a name built by concatenation is not read as its first part  "
+          "<-- pinned defect")
+    check(job_references("EXEC sp_stop_job @job_name = N'a' + N' b'") == [],
+          "two literals joined by + are not a name either")
+    check(job_references("EXEC sp_stop_job @job_name = N'ok'; SELECT 1 + 2")
+          == [("name", "ok")], "a + after the statement is not concatenation")
+    check(job_references(
+        "DECLARE @sql nvarchar(max) = N'EXEC msdb.dbo.sp_stop_job "
+        "@job_name = N''nightly'';'; EXEC sp_executesql @sql;") == [],
+          "a call inside dynamic SQL is not seen, and no empty name is read  "
+          "<-- pinned defect")
+    check(job_references("PRINT 'call sp_stop_job N''x'' later'") == [],
+          "a call written inside a string is not a binding")
+    check(job_references(
+        "SELECT j.name FROM msdb.dbo.sysjobs j JOIN msdb.dbo.syscategories "
+        "c ON c.category_id = j.category_id WHERE c.name = N'Data "
+        "Collector'") == [],
+          "a name compared on another table is not a job name  "
+          "<-- pinned defect")
+    check(job_references(
+        "SELECT j.name FROM msdb.dbo.sysjobs j JOIN msdb.dbo.syscategories "
+        "c ON c.category_id = j.category_id WHERE j.name = N'x'") ==
+          [("name", "x")], "and the alias of sysjobs is still read")
+    check(job_references("SELECT 1 FROM [msdb].[dbo].[sysjobs] AS j WHERE "
+                         "j.[name] = N'x'") == [("name", "x")],
+          "brackets around the table and the column are read")
+    check(job_references("SELECT 1 FROM msdb.dbo.sysjobs WHERE "
+                         "msdb.dbo.sysjobs.name = N'x'") == [("name", "x")],
+          "a name qualified by the full table name is read")
+    check(job_references(
+        "SELECT 1 FROM msdb.dbo.sysjobs; SELECT d.name FROM sys.databases "
+        "AS d WHERE d.name = N'StagingDB'") == [],
+          "a database name beside a sysjobs read is not a job name  "
+          "<-- pinned defect")
+    check(job_references(
+        "SELECT 1 FROM msdb.dbo.sysjobs JOIN msdb.dbo.sysjobschedules ON "
+        "1 = 1 WHERE name = N'x'") == [],
+          "a bare name is read only when sysjobs is the only table")
+    check(job_references("SELECT 1 FROM msdb.dbo.sysjobs; SET @name = N'x'")
+          == [], "a variable called @name is not the column")
+    check(job_references(
+        "IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = N'X') "
+        "EXEC msdb.dbo.sp_add_job @job_name = N'X'") == [],
+          "a job that the step creates if it is missing is not a binding  "
+          "<-- pinned defect")
+    check(job_references("IF NOT EXISTS (SELECT 1 FROM msdb.dbo.sysjobs "
+                         "WHERE (name = N'X'))") == [],
+          "a NOT EXISTS stays open across nested parentheses")
+    check(job_references("IF NOT EXISTS (SELECT 1 FROM dbo.t) SELECT 1 FROM "
+                         "msdb.dbo.sysjobs j WHERE j.name = N'X'") ==
+          [("name", "X")], "after the NOT EXISTS closes, a name is read")
+    check(job_references("EXEC sp_add_job @job_name = N'a'; EXEC "
+                         "sp_stop_job @job_name = N'b'") == [("name", "b")],
+          "sp_add_job exempts only its own name")
+    check(job_references("EXEC x @job_name = N'q'") == [("name", "q")],
+          "a @job_name with no procedure before it is read")
+    check(job_references("EXEC sp_start_job @job_id = 'nope'") == [],
+          "a @job_id literal that is not a job id is not read")
+    check(job_references("EXEC SP_ADD_JOB @job_name = N'a'") == [],
+          "sp_add_job is found ignoring case")
+    check(job_references("SELECT 1 FROM MSDB.DBO.SYSJOBS AS J WHERE "
+                         "j.NAME = N'x'") == [("name", "x")],
+          "table, alias and column are matched ignoring case")
+    check(job_references("SELECT 1 FROM sysjobs j WHERE J.name = N'x'") ==
+          [("name", "x")], "an alias is matched ignoring case")
+    check(job_references("SELECT 1 FROM SYSJOBS_VIEW WHERE name = N'x'") ==
+          [("name", "x")], "a bare name is read from an upper-case table")
+
     # ---- LIKE
     check(like_regex("%load%").match("Nightly LOAD v2") is not None,
           "LIKE '%load%' matches across case")
@@ -865,6 +1109,13 @@ def self_test():
           like_regex("[ab").match("[ab") is not None,
           "an empty or unclosed bracket is literal")
 
+    raises(lambda: like_regex("x[^]"),
+           "a LIKE pattern with an empty negated class is refused  "
+           "<-- pinned defect")
+    raises(lambda: like_regex("a[z-a]"),
+           "a LIKE pattern with a reversed range is refused  "
+           "<-- pinned defect")
+
     # ---- resolving references
     jobs = [Job("00000000-0000-4000-8000-000000000001", "nightly load v2", 1),
             Job("00000000-0000-4000-8000-000000000002", "watchdog", 1),
@@ -881,6 +1132,15 @@ def self_test():
           "a LIKE pattern resolves to every job it matches")
     check(resolve("id", "00000000-0000-4000-8000-000000000002", jobs) ==
           (["watchdog"], False), "a job id resolves to its job")
+    check(resolve("name", " nightly load v2", jobs) == ([], False),
+          "leading spaces are part of a name, and only trailing ones are "
+          "ignored")
+    lead = [Job("00000000-0000-4000-8000-0000000000c1", "  lead", 1),
+            Job("00000000-0000-4000-8000-0000000000c2", "  FOLD", 1)]
+    check(resolve("name", "lead", lead) == ([], False) and
+          resolve("name", "fold", lead) == ([], False),
+          "a job name with leading spaces is not the name without them")
+
 
     def watch(command, sid=1):
         return Step("00000000-0000-4000-8000-000000000002", sid, "stop",
@@ -1020,7 +1280,13 @@ def self_test():
     check(found == [], "step rows of a run with no outcome row yet are "
           "ignored")
     found, base = analyse_history(hjob, [])
-    check(found == [] and base == {}, "a job with no history has no findings")
+    check(kinds(found) == ["NO_BASELINE"] and base == {} and
+          "no finished run" in found[0].text and not found[0].gate,
+          "a job with no run in a supplied history export is NO_BASELINE, "
+          "never a silent pass  <-- pinned defect")
+    found, _ = analyse_history(hjob, history(run(90000, 4)))
+    check(kinds(found) == ["NO_BASELINE"],
+          "a job whose only run is still In Progress is NO_BASELINE too")
 
     # ---- activity
     exported = t0 + datetime.timedelta(days=9)
@@ -1046,6 +1312,77 @@ def self_test():
           "a running job with no median is NO_BASELINE, never a pass")
     raises(lambda: analyse_activity(hjob, [act(-5)], base),
            "a start after the export time is refused")
+
+    # ---- the boundaries of the timing rules
+    found, base = analyse_history(
+        hjob, history(*normal), min_runs=3,
+        baseline_before=t0 + datetime.timedelta(days=3))
+    check(base[jid][1] == 3,
+          "a run that started exactly at --baseline-before is left out of "
+          "the median")
+    found, base = analyse_history(hjob, history(*normal), min_runs=6)
+    check(base[jid][1] == 6,
+          "exactly --min-runs runs are enough for a median")
+    found, _ = analyse_history(hjob, history(*(normal[:3] + [
+        run(20000, day=7)])))
+    check(kinds(found) == ["NO_BASELINE"] and "4 run(s) were not timed" in
+          found[0].text,
+          "a hung run of a job with too few other runs is NO_BASELINE, not "
+          "timed against a thin median")
+    quick = [run(10, day=d) for d in range(6)]
+    found, _ = analyse_history(hjob, history(*(quick + [run(300, day=7)])))
+    check(kinds(found) == ["FAR_PAST_NORMAL"],
+          "a run of exactly --min-seconds is timed")
+    found, _ = analyse_history(hjob, history(*[run(1, day=d)
+                                                for d in range(7)]),
+                               min_seconds=0)
+    check(found == [], "--min-seconds 0 does not flag a run at its median")
+
+    def sample(seconds):
+        return Activity(jid, exported - datetime.timedelta(seconds=seconds),
+                        None, exported)
+
+    base = {jid: (100, 6)}
+    check(analyse_activity(hjob, [sample(1000)], base) == [],
+          "a run going for exactly ten times its median is not past it")
+    check(kinds(analyse_activity(hjob, [sample(1001)], base)) ==
+          ["RUNNING_PAST_NORMAL"], "one second more is")
+    base = {jid: (1, 6)}
+    check(kinds(analyse_activity(hjob, [sample(300)], base)) ==
+          ["RUNNING_PAST_NORMAL"],
+          "a run going for exactly --min-seconds is timed")
+    check(analyse_activity(hjob, [sample(299)], base) == [],
+          "and one second under is not")
+    check(analyse_activity(hjob, [sample(0)], base) == [],
+          "a job started in the second of the export is not an error")
+
+    def brute(vals, skip):
+        rest = list(vals)
+        if skip is not None:
+            rest.remove(skip)
+        return statistics.median(rest)
+
+    lists = [[5], [1, 1], [1, 2, 3], [1, 2, 2, 9], [3, 3, 3, 3, 3],
+             [1, 4, 4, 6, 10, 10, 11]]
+    check(all(median_less(v, k) == brute(v, k)
+              for v in lists for k in [None] + v if len(v) > 1 or k is None),
+          "median_less() equals the median of the shorter list, for every "
+          "list and every skipped value")
+
+    jobs2 = [Job("00000000-0000-4000-8000-0000000000b1", "B job", 1),
+             Job("00000000-0000-4000-8000-0000000000a1", "a job", 1)]
+    check([f.job for f in build_report(jobs2, []).findings] ==
+          ["a job", "B job"],
+          "findings of one kind are ordered by job name, ignoring case")
+
+    check(clip("x" * 30) == "'" + "x" * 30 + "'",
+          "a value that fits in the width is not cut")
+    mixed = [run(s, day=d) for d, s in enumerate((900, 100, 500, 200, 800,
+                                                   300))]
+    found, _ = analyse_history(hjob, history(*(mixed + [run(20000, day=7)])))
+    check(kinds(found) == ["FAR_PAST_NORMAL"] and "median 6m 40s" in
+          found[0].text,
+          "the median is taken from durations in any order")
 
     # ---- the tables together
     raises(lambda: check_tables([job(), job()], [], [], []),
@@ -1087,6 +1424,8 @@ def self_test():
     # ---- real files on disk, through main(). One temp directory, deleted
     # again at the end.
     tmp = tempfile.mkdtemp(prefix="stepflow-selftest-")
+    # An unexpected exception must not leave the directory behind.
+    atexit.register(shutil.rmtree, tmp, True)
 
     def tmpfile(name, text, encoding="utf-8"):
         path = os.path.join(tmp, name)
@@ -1290,6 +1629,149 @@ def self_test():
                             "--steps", steps_csv])
     check(code == 2 and "missing.csv" in err, "a missing file exits 2")
 
+    # ---- exports that look fine and say nothing
+    bare = tmpfile("bare.csv", "job_id,name,start_step_id,eol\n")
+    code, out, err = run_cli(["--jobs", bare, "--steps", steps_csv])
+    check(code == 2 and "jobs export has no rows" in err and out == "",
+          "a jobs export with a header and no rows exits 2, not a clean "
+          "pass  <-- pinned defect")
+    bare_act = tmpfile("bareact.csv", "job_id,start_execution_date,"
+                       "stop_execution_date,exported_at,eol\n")
+    code, out, err = run_cli(["--jobs", jobs_csv, "--activity", bare_act])
+    check(code == 2 and "activity export has no rows" in err,
+          "an activity export with no rows exits 2: it cannot show a "
+          "running job  <-- pinned defect")
+    bare_hist = tmpfile("barehist.csv", "instance_id,job_id,step_id,"
+                        "run_status,run_date,run_time,run_duration,eol\n")
+    code, out, _ = run_cli(["--jobs", jobs_csv, "--history", bare_hist])
+    check(code == 0 and out.count("NO_BASELINE") == 3 and
+          "no finished run" in out,
+          "a history export with no rows warns once for every job")
+    code, out, _ = run_cli(["--jobs", jobs_csv, "--history", history_csv])
+    check(out.count("NO_BASELINE") == 2 and
+          "watchdog, load: it has no finished run" in out,
+          "a job with no run in a history export is NO_BASELINE, and a job "
+          "that has runs is not  <-- pinned defect")
+
+    # ---- paths, numbers and counts
+    code, _, err = run_cli(["--jobs", jobs_csv, "--steps", ""])
+    check(code == 2 and "error: " in err,
+          "an empty --steps, an unset shell variable, exits 2 and is not "
+          "skipped  <-- pinned defect")
+    code, _, err = run_cli(["--jobs", jobs_csv, "--history", history_csv,
+                            "--report", history_csv, "--apply"])
+    with open(history_csv, encoding="utf-8") as handle:
+        kept = handle.read()
+    check(code == 64 and "names an input export" in err and
+          kept.startswith("instance_id"),
+          "--report naming an input export is refused, and the export is "
+          "kept  <-- pinned defect")
+    hist_rows = tmpfile("histrows.csv", "instance_id,job_id,step_id,"
+                        "run_status,run_date,run_time,run_duration\n"
+                        "(1 rows affected)\n")
+    code, _, err = run_cli(["--jobs", jobs_csv, "--history", hist_rows])
+    check(code == 2 and "SET NOCOUNT ON" in err and "-y 0" not in err,
+          "a '(1 rows affected)' line in a history export names SET "
+          "NOCOUNT ON, not -y 0  <-- pinned defect")
+    spaced = tmpfile("spaced.csv", jobs_text + "   \r\n")
+    code, out, _ = run_cli(["--jobs", spaced, "--steps", steps_csv])
+    code8, out8, _ = run_cli(["--jobs", jobs_csv, "--steps", steps_csv])
+    check(code == code8 and out == out8,
+          "a trailing line of spaces is not a cut row  <-- pinned defect")
+    for value in ("1_0", "\u0661"):
+        bad = tmpfile("digit.csv", "job_id,step_id,step_name,"
+                      "on_success_action,on_success_step_id,on_fail_action,"
+                      "on_fail_step_id,command\n%s,%s,x,1,0,2,0,\n"
+                      % (j_load, value))
+        code, _, err = run_cli(["--jobs", jobs_csv, "--steps", bad])
+        check(code == 2 and "not a whole number" in err,
+              "%s is not read as a whole number  <-- pinned defect"
+              % ascii(value))
+    bad = tmpfile("overflow.csv", "instance_id,job_id,step_id,run_status,"
+                  "run_date,run_time,run_duration\n1,%s,0,1,"
+                  "99999999999999999999,0,1\n" % j_load)
+    code, _, err = run_cli(["--jobs", jobs_csv, "--history", bad])
+    check(code == 2 and "not a date and time" in err,
+          "a run_date past a C long exits 2, not 1 with a traceback  "
+          "<-- pinned defect")
+    bad = tmpfile("secret.csv", "job_id,step_id,step_name,on_success_action,"
+                  "on_success_step_id,on_fail_action,on_fail_step_id,command"
+                  "\n%s,%sHunter2Secret,x,1,0,2,0,\n" % (j_load, "x" * 40))
+    code, _, err = run_cli(["--jobs", jobs_csv, "--steps", bad])
+    check(code == 2 and "line 2" in err and "Hunter2" not in err,
+          "an error cuts the cell it quotes, so a shifted column is not "
+          "copied into a log  <-- pinned defect")
+    badlike = tmpfile("badlike.csv", "job_id,step_id,step_name,"
+                      "on_success_action,on_success_step_id,on_fail_action,"
+                      "on_fail_step_id,command\n%s,1,x,1,0,2,0,\"SELECT 1 "
+                      "FROM msdb.dbo.sysjobs WHERE name LIKE N'x[^]'\"\n"
+                      % j_load)
+    code, _, err = run_cli(["--jobs", jobs_csv, "--steps", badlike])
+    check(code == 2 and "not a valid character class" in err,
+          "a LIKE pattern that is not a valid class exits 2, not 1 with a "
+          "traceback  <-- pinned defect")
+    code, _, err = run_cli(["--jobs", jobs_csv, "--steps", orphan])
+    check("@delete_history" in err,
+          "the orphan message names a deleted job's history rows too")
+    hdr = tmpfile("hdrcase.csv", "Job_ID,Name,Start_Step_Id\n%s,hourly,1\n"
+                  % j_hour)
+    code, out, _ = run_cli(["--jobs", hdr, "--steps", clean_steps])
+    check(code == 0, "column names are read ignoring case")
+    for flag, value in (("--min-runs", "1"), ("--min-seconds", "0")):
+        code, _, _ = run_cli(["--jobs", jobs_csv, "--steps", steps_csv,
+                              flag, value])
+        check(code == 1, "%s %s is accepted" % (flag, value))
+
+    # ---- output that cannot be encoded, and a reader that quits
+    arrow = tmpfile("arrow.csv", "job_id,name,start_step_id\n%s,load \u2192 "
+                    "v2,1\n" % j_load)
+    arrow_steps = tmpfile("arrowsteps.csv", "job_id,step_id,step_name,"
+                          "on_success_action,on_success_step_id,"
+                          "on_fail_action,on_fail_step_id,command\n"
+                          "%s,1,a,1,0,2,0,\n%s,2,b,1,0,2,0,\n"
+                          % (j_load, j_load))
+    raw = io.BytesIO()
+    narrow = io.TextIOWrapper(raw, encoding="ascii", newline="\n")
+    with contextlib.redirect_stdout(narrow), \
+            contextlib.redirect_stderr(io.StringIO()):
+        code = main(["--jobs", arrow, "--steps", arrow_steps])
+    narrow.flush()
+    check(code == 1 and b"load ? v2: step 2 (b) never runs" in raw.getvalue(),
+          "a job name outside the output code page prints with a ? and does "
+          "not crash the report  <-- pinned defect")
+
+    class Broken(io.StringIO):
+        fd = None
+
+        def write(self, text):
+            raise BrokenPipeError("the reader quit")
+
+        def fileno(self):
+            if self.fd is None:
+                raise io.UnsupportedOperation("fileno")
+            return self.fd
+
+    def quit_early(fd):
+        stream = Broken()
+        stream.fd = fd
+        with contextlib.redirect_stdout(stream), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return main(["--jobs", jobs_csv, "--steps", steps_csv])
+
+    code = quit_early(None)
+    check(code == 1, "a reader that quits early does not end the run in a "
+          "traceback  <-- pinned defect")
+    sink = os.path.join(tmp, "sink.bin")
+    fd = os.open(sink, os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0))
+    try:
+        code = quit_early(fd)
+        written = os.write(fd, b"x")
+    finally:
+        os.close(fd)
+    check(code == 1 and written == 1 and os.path.getsize(sink) == 0,
+          "and stdout is pointed at the null device, so exit cannot fail on "
+          "the flush")
+
     # ---- writing, and the parser
     report_path = os.path.join(tmp, "report.txt")
     code, out, _ = run_cli(["--jobs", jobs_csv, "--steps", steps_csv,
@@ -1326,7 +1808,9 @@ def self_test():
     check(code == 64 and "--steps, --history or --activity" in err,
           "--jobs alone checks nothing, and says so")
     for flag, value in (("--factor", "1"), ("--min-runs", "0"),
-                        ("--min-seconds", "-1"),
+                        ("--min-seconds", "-1"), ("--factor", "nan"),
+                        ("--factor", "inf"), ("--min-seconds", "nan"),
+                        ("--min-seconds", "inf"),
                         ("--baseline-before", "09/05/2026")):
         code, _, err = run_cli(["--jobs", jobs_csv, "--steps", steps_csv,
                                 flag, value])
@@ -1381,6 +1865,9 @@ def self_test():
         sys.path.remove(here)
     check(module.SQL == SQL and callable(module.main),
           "the file imports as a module without running main")
+    with open(os.path.join(here, "stepflow.py"), "rb") as handle:
+        check(max(bytearray(handle.read())) < 128,
+              "the source file is pure ASCII  <-- pinned defect")
 
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1434,15 +1921,15 @@ def read_table(path, required):
     for cells in reader:
         # A record can span lines, so name the line it starts on.
         line, end = end + 1, reader.line_num
-        if not cells:
+        if not any(cell.strip() for cell in cells):
             continue
         row = dict((h, "") for h in header)
         row.update(zip(header, cells))
         row["_line"] = line
-        if "rows affected" in row["job_id"]:
-            raise ValueError("%s line %d: %r is a row count. Put SET NOCOUNT "
+        if "rows affected" in cells[0]:
+            raise ValueError("%s line %d: %s is a row count. Put SET NOCOUNT "
                              "ON at the top of the query."
-                             % (path, line, row["job_id"]))
+                             % (path, line, clip(cells[0])))
         if "eol" in header and row["eol"].strip() != "$":
             raise ValueError("%s line %d: the row is cut short. Run sqlcmd "
                              "with -y 0, or it cuts every long value at 256 "
@@ -1451,20 +1938,23 @@ def read_table(path, required):
     return rows
 
 
+_INT = re.compile(r"\A[+-]?[0-9]+\Z")
+
+
 def _cell_int(row, column, path):
     value = row.get(column, "").strip()
-    try:
-        return int(value)
-    except ValueError:
-        raise ValueError("%s line %d: %s is %r, not a whole number"
-                         % (path, row["_line"], column, value))
+    # int() alone also reads 1_0 and digits from other scripts.
+    if not _INT.match(value):
+        raise ValueError("%s line %d: %s is %s, not a whole number"
+                         % (path, row["_line"], column, clip(value)))
+    return int(value)
 
 
 def _cell_job(row, path):
     value = row["job_id"].strip()
     if not _GUID.match(value):
-        raise ValueError("%s line %d: %r is not a job id"
-                         % (path, row["_line"], value))
+        raise ValueError("%s line %d: %s is not a job id"
+                         % (path, row["_line"], clip(value)))
     return value
 
 
@@ -1478,8 +1968,8 @@ def _cell_time(row, column, path, required=False):
     try:
         return datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        raise ValueError("%s line %d: %s is %r, not YYYY-MM-DD HH:MM:SS"
-                         % (path, row["_line"], column, value))
+        raise ValueError("%s line %d: %s is %s, not YYYY-MM-DD HH:MM:SS"
+                         % (path, row["_line"], column, clip(value)))
 
 
 def load_jobs(path):
@@ -1495,7 +1985,7 @@ def load_steps(path):
             if _cell_int(r, column, path) not in (1, 2, 3, 4):
                 raise ValueError("%s line %d: %s is %s, and only 1 to 4 are "
                                  "defined" % (path, r["_line"], column,
-                                              r[column]))
+                                              r[column].strip()[:32]))
         steps.append(Step(_cell_job(r, path), _cell_int(r, "step_id", path),
                           r["step_name"],
                           _cell_int(r, "on_success_action", path),
@@ -1588,7 +2078,32 @@ def _usage(message):
     return 64
 
 
+def _emit(lines):
+    """Print lines. A reader that quits early (| head) ends the output, not
+    the run: exit 1 means findings, and a traceback must not claim that."""
+    try:
+        for line in lines:
+            print(line)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Point stdout at the null device, or the flush at exit fails again.
+        try:
+            null = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null, sys.stdout.fileno())
+            finally:
+                os.close(null)
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv=None):
+    # A job or step name outside the console code page must not crash the
+    # report: that traceback would exit 1, which reads as findings.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="replace")
     args = _parse(sys.argv[1:] if argv is None else argv)
 
     if args.self_test:
@@ -1596,20 +2111,30 @@ def main(argv=None):
     if args.sql:
         sys.stdout.write(SQL[args.sql])
         return 0
-    if not args.jobs:
+    # "is None", not truthiness: --steps "" (an unset shell variable) is a
+    # path that cannot be opened, and exits 2, not a check that is skipped.
+    paths = (args.jobs, args.steps, args.history, args.activity)
+    if args.jobs is None:
         return _usage("--jobs is required. Print its SELECT with --sql jobs.")
-    if not (args.steps or args.history or args.activity):
+    if paths[1:] == (None, None, None):
         return _usage("give --steps, --history or --activity as well. "
                       "--jobs alone checks nothing.")
-    if args.factor <= 1:
-        return _usage("--factor must be more than 1, or a normal run is "
-                      "flagged.")
+    # Written as a range test so that nan, which fails every comparison, is
+    # refused too. inf would turn the timing checks off.
+    if not 1 < args.factor < float("inf"):
+        return _usage("--factor must be more than 1 and finite, or a normal "
+                      "run is flagged or no run is.")
     if args.min_runs < 1:
         return _usage("--min-runs must be 1 or more.")
-    if args.min_seconds < 0:
-        return _usage("--min-seconds cannot be negative.")
+    if not 0 <= args.min_seconds < float("inf"):
+        return _usage("--min-seconds must be 0 or more and finite.")
     if args.apply and not args.report:
         return _usage("--apply needs --report.")
+    inputs = [os.path.normcase(os.path.abspath(p)) for p in paths if p]
+    if args.report and os.path.normcase(os.path.abspath(args.report)) in \
+            inputs:
+        return _usage("--report names an input export, and --apply would "
+                      "overwrite it.")
     before = None
     if args.baseline_before:
         try:
@@ -1621,9 +2146,10 @@ def main(argv=None):
 
     try:
         jobs = load_jobs(args.jobs)
-        steps = load_steps(args.steps) if args.steps else None
-        history = load_history(args.history) if args.history else None
-        activity = load_activity(args.activity) if args.activity else None
+        steps = None if args.steps is None else load_steps(args.steps)
+        history = None if args.history is None else load_history(args.history)
+        activity = None if args.activity is None else \
+            load_activity(args.activity)
         report = build_report(jobs, steps, history, activity, args.factor,
                               args.min_runs, args.min_seconds, before)
     except (ValueError, OSError, csv.Error) as exc:
@@ -1633,12 +2159,11 @@ def main(argv=None):
         return 2
 
     lines = describe(report)
-    for line in lines:
-        print(line)
+    _emit(lines)
 
     if args.report:
         if not args.apply:
-            print("\n--report without --apply: nothing was written.")
+            _emit(["", "--report without --apply: nothing was written."])
         else:
             # A traceback here would exit 1, which reads as "findings". A
             # failed write is a different fact with its own code.
@@ -1649,7 +2174,7 @@ def main(argv=None):
                 print("error: could not write %s: %s" % (args.report, exc),
                       file=sys.stderr)
                 return 2
-            print("\nwrote %s" % args.report)
+            _emit(["", "wrote %s" % args.report])
     return gate(report)
 
 

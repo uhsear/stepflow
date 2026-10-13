@@ -37,6 +37,10 @@ PASS  a step whose failure quits reporting success is FAIL_REPORTS_SUCCESS  <-- 
 ...
 PASS  a watchdog whose target was renamed is DISARMED, once  <-- pinned defect
 ...
+PASS  a name in a -- comment is not a binding  <-- pinned defect
+PASS  a call inside dynamic SQL is not seen, and no empty name is read  <-- pinned defect
+PASS  a name compared on another table is not a job name  <-- pinned defect
+...
 PASS  a 5 hour run against a 102.5 second median is FAR_PAST_NORMAL  <-- pinned defect
 PASS  and it says the run reads as Succeeded, with its ratio
 ...
@@ -53,14 +57,17 @@ PASS  and it names the line the cut row starts on, not where the reader stopped 
 ...
 PASS  a prefix --ap of --apply is refused, and nothing is written  <-- pinned defect
 ...
+PASS  a jobs export with a header and no rows exits 2, not a clean pass  <-- pinned defect
+PASS  an empty --steps, an unset shell variable, exits 2 and is not skipped  <-- pinned defect
+...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the footer counts a failure and exits 1 on it
 PASS  the file imports as a module without running main
 --------------------------------------------------------------------
-154 assertions, 0 failed
+233 assertions, 0 failed
 ```
 
-The full run prints all 154 assertions. Each `...` line marks a cut in this block.
+The full run prints all 233 assertions. Each `...` line marks a cut in this block.
 
 ## What already exists
 
@@ -76,8 +83,8 @@ The full run prints all 154 assertions. Each `...` line marks a cut in this bloc
   50 percent over the average. It is a good fit for a team that already runs Pester checks.
 
 stepflow does not need a connection. It walks the whole step graph from the start step, so a
-step behind another unreachable step is reported too. It resolves every job that a step command
-names. It times each run against a median, not an average, because one hung run inflates an
+step behind another unreachable step is reported too. It resolves every job that a string literal in a
+step command names. It times each run against a median, not an average, because one hung run inflates an
 average and hides the next one.
 
 The name `stepflow` is also used by unrelated GitHub projects: a macro-step library, a workflow
@@ -88,8 +95,9 @@ engine and an AWS Step Functions dashboard. None of them reads SQL Server Agent.
 Python 3.9 or newer and nothing else. No database driver, no third-party package, no network.
 You run the SELECTs yourself with `sqlcmd` and give stepflow the CSV files.
 
-The same 154 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
-(Python 3.9.25).
+The same 233 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
+(Python 3.9.25). The three runs print the same text, except that Windows ends each line with
+CR LF. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`).
 
 ```
 git clone https://github.com/uhsear/stepflow.git
@@ -100,6 +108,12 @@ git clone https://github.com/uhsear/stepflow.git
 1. Print each SELECT into a file.
 2. Run each file with `sqlcmd` against `msdb`, with `-y 0`. Add your own connection options.
 3. Give stepflow the CSV files.
+
+**The steps export is as sensitive as `msdb`.** It holds the full text of every job step
+command, and CmdExec, SSIS and PowerShell steps often carry a password or a connection
+string (for example `sqlcmd -P`). stepflow never prints a command, but the CSV file holds
+it. Keep `steps.csv` out of any repository and any ticket. `.gitignore` lists the file names
+used here, but a different name is not covered. Delete the exports when the run is done.
 
 ```
 python stepflow.py --sql jobs > jobs.sql
@@ -121,14 +135,14 @@ python stepflow.py --jobs jobs.csv --steps steps.csv --report stepflow.txt --app
 | `--steps` | off | The `sysjobsteps` export. Turns on the step flow and job reference checks. |
 | `--history` | off | The `sysjobhistory` export. Turns on the duration and green-over-failure checks. |
 | `--activity` | off | The `sysjobactivity` export. Times the runs that are still going. |
-| `--factor` | `10` | A run longer than this many times the median is flagged. Must be more than 1. |
+| `--factor` | `10` | A run longer than this many times the median is flagged. Must be more than 1 and finite. |
 | `--min-runs` | `5` | The fewest other successful runs a median is taken from. |
-| `--min-seconds` | `300` | A run shorter than this is never flagged, whatever its ratio. |
+| `--min-seconds` | `300` | A run shorter than this is never flagged, whatever its ratio. Must be 0 or more and finite. |
 | `--baseline-before` | off | Take the median only from runs that started before this date, `YYYY-MM-DD`. |
-| `--report` | off | Write the report to this file. Needs `--apply`. |
+| `--report` | off | Write the report to this file. Needs `--apply`. It cannot name an input export. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
 | `--sql` | off | Print the SELECT for `jobs`, `steps`, `history` or `activity`, and exit. |
-| `--self-test` | off | Run the assertions and exit. |
+| `--self-test` | off | Run the assertions and exit. It writes fixtures to a temporary directory and removes it. |
 
 Give `--jobs` and at least one other export. Take all the exports at the same time. An export
 that names a job id that is not in the jobs export exits 2.
@@ -153,12 +167,20 @@ stepflow names `-y 0` in both cases.
 | A Windows PowerShell 5.1 `>` redirect (UTF-16) | Reads the file the same as UTF-8. |
 | A file in a single-byte code page | Exits 2 if the bytes are not UTF-8, and names `-f o:65001`. |
 
-`-W` cannot be used with `-y`, and `-h -1` cannot be used with `-y 0`. `sqlcmd` refuses both
-combinations.
+Microsoft documents that `-W` "can't be used with the `-y` or `-Y` options". Do not add `-W`.
 
-The activity SELECT reads only the newest SQL Server Agent session. Microsoft's example for
-`sysjobactivity` filters on the newest session too. It records the server clock as `exported_at`, so a run's age does not
-depend on the clock of the machine that runs stepflow.
+The same page gives `-w` a default of 80 and says that "when an output line exceeds the
+specified column width, it wraps on to the next line". The run below used no `-w`, and its
+3,972 character row came back whole. So the wrap did not apply to this one-column output on
+that build. Other `sqlcmd` builds were not tested. If a command comes back with a line break
+that you did not write, add `-w 65535`, the largest width the page allows.
+
+The activity SELECT reads only the newest SQL Server Agent session. It takes that session as
+`MAX(session_id)` from `msdb.dbo.syssessions`. Microsoft's example for `sysjobactivity` also
+keeps only the newest session, but it takes `MAX(session_id)` from `sysjobactivity` itself. The
+two agree while Agent has run a job in the newest session, and differ when it has not. The
+SELECT records the server clock as `exported_at`, so a run's age does not depend on the clock
+of the machine that runs stepflow.
 
 ## What it checks
 
@@ -169,12 +191,12 @@ depend on the clock of the machine that runs stepflow.
 | `DANGLING` | fail | A step that runs goes to a step that does not exist. This includes "go to the next step" on the last step. |
 | `FAIL_REPORTS_SUCCESS` | fail | When this step fails, the job quits reporting success. |
 | `DISARMED` | fail | A step command names a job, by name, pattern or id, and no job matches. |
-| `GREEN_OVER_FAILED_STEP` | fail | A run reads as Succeeded, and a step failed in it. |
+| `GREEN_OVER_FAILED_STEP` | fail | A run reads as Succeeded, and a step failed in it. A step that is meant to fail and go on to a clean-up step fails the gate on every run. |
 | `FAR_PAST_NORMAL` | fail | A finished run took more than `--factor` times the median of the job's other successful runs. |
 | `RUNNING_PAST_NORMAL` | fail | A run that is still going has run longer than that. |
 | `FAIL_CAN_END_GREEN` | warn | When this step fails, the job goes on to a step, and a path from there quits reporting success. |
 | `NAME_BOUND` | warn | A step command finds a job by its name. It works today, and a rename disarms it. |
-| `NO_BASELINE` | warn | Some runs were not timed, because the job has too few successful runs to take a median from. |
+| `NO_BASELINE` | warn | Some runs were not timed, because the job has too few successful runs to take a median from, or the job has no finished run in the history export. |
 
 A step that never runs is reported once, as `UNREACHABLE`. Its own routes cannot fire, so they
 are not reported as well.
@@ -188,9 +210,11 @@ Canceled.
 
 ### What SQL Server Agent does
 
-The kinds rest on what SQL Server Agent does with each case. Each case below was run on SQL
-Server 2022 CU27 (16.0.4295.3), Developer edition on Linux, in a container, with SQL Server
-Agent running. The messages are quoted from `sysjobhistory`.
+The kinds rest on what SQL Server Agent does with each case. Each case below was run once on
+SQL Server 2022 CU27 (16.0.4295.3), Developer edition on Linux, in a container, with SQL Server
+Agent running. The messages are quoted from `sysjobhistory`. This repository holds no SQL Server
+and no script for these runs, so you cannot repeat the table from here. The assertions in the
+self-test pin what stepflow does with each case, not what Agent does.
 
 | Case | Observed |
 |---|---|
@@ -216,13 +240,22 @@ stepflow reads these forms in every step command, of every subsystem:
 
 - `@job_name = N'...'`, as `sp_start_job`, `sp_stop_job` and the other job procedures take it.
 - `sp_start_job N'...'` and `sp_stop_job N'...'`, with the name as the first positional value.
-- `name = N'...'` and `name LIKE N'...'`, only in a command that reads `sysjobs` or `sysjobs_view`.
+- `name = N'...'` and `name LIKE N'...'`, only when the column is the one of `sysjobs` or
+  `sysjobs_view`: `j.name` where `j` is an alias of that table, or a bare `name` when it is the
+  only table the command reads. `c.name` on `syscategories` is not read.
 - `@job_id = '...'`, a literal job id.
 
 A name resolves the way T-SQL `=` compares on a case-insensitive collation: trailing spaces and
 case are ignored. A name that matches only when case is ignored is reported with a note that a
 case-sensitive `msdb` collation disarms it now. A `LIKE` pattern resolves with `%`, `_` and
 `[...]`. A literal job id that exists is not reported, because a rename does not break it.
+
+stepflow cuts out every comment (`--` and nested `/* */`) and every string literal first, and
+matches the forms above in the code that is left. A call inside a comment, inside a `PRINT`
+text or inside dynamic SQL is not a binding. A name that ends in `+`, such as
+`N'Backup - ' + @@SERVERNAME`, is built at run time and is not read. The name that
+`sp_add_job` gives a new job is not read, and neither is a lookup inside a `NOT EXISTS (...)`,
+because both expect the job to be absent.
 
 A value that holds an Agent token, such as `$(ESCAPE_SQUOTE(JOBNAME))`, is skipped. Agent
 replaces the token at run time. For a step that acts on its own job, the token is the fix:
@@ -255,14 +288,15 @@ FAIL  FAR_PAST_NORMAL        sf nightly refresh: the run started 2026-10-09 11:2
 FAIL  RUNNING_PAST_NORMAL    sf hourly load: it has been running for 10m 05s, and its median is 2s over 6 successful run(s).
 WARN  FAIL_CAN_END_GREEN     sf green over failed: when step 1 (work) fails, the job goes on to step 2 (tidy), and a path from there quits reporting success.
 WARN  NAME_BOUND             sf "quoted", comma job: step 1 (step, with comma) finds the job named 'sf hourly load' by its name. A rename disarms it without an error.
+WARN  NO_BASELINE            sf "quoted", comma job: it has no finished run in the history export, so nothing was timed.
 WARN  NO_BASELINE            sf appended: 1 run(s) were not timed: fewer than 5 other successful run(s) to take a median from.
 ...
 
-VERDICT: 13 finding(s) fail the gate, 12 warning(s).
+VERDICT: 13 finding(s) fail the gate, 14 warning(s).
 ```
 
-The `...` line cuts nine more `NO_BASELINE` warnings, one for each job that ran once. The same
-exports give the same report on Windows and on Ubuntu.
+The `...` line cuts ten more `NO_BASELINE` warnings: nine for jobs that ran once, and one for
+`sf no steps`, which never ran. The same exports give the same report on Windows and on Ubuntu.
 
 The job `sf "quoted", comma job` has a 3,972 character step command with commas, quotes and a
 CRLF in it. The export kept all of it, and the job reference at its end was found.
@@ -299,26 +333,71 @@ to 64.
 
 ## Limits
 
+Job references
 - It reads job references only in string literals inside step commands. A name held in a
   variable, a parameter, dynamic SQL, or a script outside `msdb` is not seen. A watchdog that is
   a scheduled script, not an Agent job, is outside its view.
+- It matches job references with regular expressions, not a T-SQL parser. The comment and
+  string rules above cover the common shapes. A shape they do not cover can still be read wrongly.
+- A job reference written with double quotes (`@job_name = "x"`, legal when `QUOTED_IDENTIFIER`
+  is `OFF`) is not read, so that step is silently not checked.
+- A lookup that is meant to find nothing, such as `IF EXISTS (... name LIKE N'Legacy%') PRINT`
+  as an inventory check, is reported as `DISARMED`, because stepflow cannot tell it from a
+  watchdog. Only a lookup inside `NOT EXISTS` is skipped.
 - The `LIKE` ESCAPE clause is not read. A pattern that uses one may resolve wrongly.
 - Name resolution assumes a case-insensitive `msdb` collation, which was the default in the
   tested container. A case-only match is still flagged, with a note.
+
+Durations
 - It sees only the history that Agent has kept. Agent can be set to trim `sysjobhistory` by
-  row count or by age. A job with few retained runs gets `NO_BASELINE`, not a pass.
+  row count or by age.
+- A job with fewer than `--min-runs` other successful runs is never timed, only warned with
+  `NO_BASELINE`. A run that hung for many hours still exits 0 if its job has too few retained
+  successful runs. With `--activity` and no `--history`, every running job gets `NO_BASELINE`
+  and the run exits 0.
+- An export that has a header and no rows is read as no data. A header-only jobs export or
+  activity export exits 2. A header-only history export warns `NO_BASELINE` for every job. A
+  header-only steps export reports `START_MISSING` for every job.
 - It reads `sysjobactivity` for the newest Agent session only. A run left open by an earlier
   session is not seen as running.
+- Step rows of a run that Agent never closed (a service restart or a crash) have no outcome
+  row. The next outcome row takes them, so an old failed step can show as
+  `GREEN_OVER_FAILED_STEP` for a later run.
+- A history row with `run_date` 0 stops the run with exit 2 ("is not a date and time"). Some
+  public `msdb` scripts filter `run_date > 0`, which suggests such rows can exist. This was not
+  checked on a real server. Remove the row from the export.
+- `msdb` can keep history rows of a job that was deleted with `@delete_history = 0`. Such a
+  row names a job id that is not in the jobs export, so the whole run exits 2.
+- Times are the server's own clock throughout. stepflow does no time zone conversion.
+
+Exports and output
+- The whole export is read into memory, so a very large steps export uses memory in proportion
+  to its size. A step command over 131072 characters (the `csv` module's field limit) cannot
+  be read and exits 2 with "field larger than field limit".
+- An empty path, such as `--steps ""` from an unset shell variable, exits 2. A path that does not
+  exist exits 2.
+- `--report` with `--apply` overwrites any existing file it names, except an input export,
+  which is refused. It does not ask first.
+- A job or step name that the output code page cannot encode prints with a `?`, so the report
+  does not crash. Set `PYTHONUTF8=1` to print it whole.
+- An error message that quotes a cell cuts it to 32 characters, so a shifted column does not
+  copy file content into a log. The cut is a safeguard, not a guarantee. Treat the exports and
+  the report as sensitive.
+- A reader that quits early (`| head -1`) ends the output without a traceback. The exit code
+  is still the gate result, but the shell reports the code of the last command in the pipe.
+
+Scope
 - It does not read schedules, alerts, operators, or multiserver (master and target) jobs.
 - It does not read job step output files or the Agent error log.
 - The SQL and every behaviour in "What SQL Server Agent does" were tested on one build: SQL
   Server 2022 CU27 on Linux, with `sqlcmd` 18.6 (ODBC) from the same container. Windows
   `sqlcmd`, the Go-based `sqlcmd`, SQL Server Management Studio exports and Azure SQL Managed
   Instance were not tested.
-- Times are the server's own clock throughout. stepflow does no time zone conversion.
 - There is no `--fix`. Changing a job's steps is an edit somebody signs for.
-- Nothing is written without `--apply`. It opens no socket and imports no database driver, so it
-  holds no credential.
+- Nothing is written without `--apply`, except that `--self-test` writes fixtures to a
+  temporary directory and removes it again. stepflow opens no socket and imports no database
+  driver, so it holds no credential. The steps export it reads does hold whatever the step
+  commands hold. See the warning under Usage.
 
 ## Sources
 
