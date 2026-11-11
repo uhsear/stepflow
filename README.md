@@ -157,12 +157,12 @@ git clone https://github.com/uhsear/stepflow.git
 ## Usage
 
 1. Print each SELECT into a file.
-2. Run each file with `sqlcmd` against `msdb`, with `-h -1` and `-y 0`. Add your own connection options.
+2. Run each file with `sqlcmd` against `msdb`, with `-h -1` and `-y 0`. Add your own connection options. Use `-E`, or set `SQLCMDPASSWORD` in the environment. Never type `-P` on the command line, because it shows the password in process lists and shell history.
 3. Give stepflow the CSV files.
 
 **The steps export is as sensitive as `msdb`.** It holds the full text of every job step
 command, and CmdExec, SSIS and PowerShell steps often carry a password or a connection
-string (for example `sqlcmd -P`). stepflow prints no step command text in an error (an error names at most twelve
+string (for example `sqlcmd -P`). stepflow prints no step command text in an error, except the cut text of a `LIKE` pattern that is not valid (see Limits). An error names at most twelve
 header cells, and only a cell that is a known column name, and it shows a rejected cell only
 when the cell holds nothing but digits and the signs of a number or a time). It does print
 a job or step name, and the job-name literal that a `DISARMED` or `NAME_BOUND` finding
@@ -621,8 +621,18 @@ Exports and output
   the exit code, not only the text.
 - A step command with tens of thousands of consecutive bracketed identifiers can make the job
   reference scan very slow.
-- The check that `--report` does not name an input compares paths, not files, so a symlink or
-  hard link to an export is not caught.
+- The check that `--report` does not name an input compares paths, not files, so a symlink, a
+  hard link or an 8.3 short name on Windows is not caught.
+- Only exports made with `--sql` carry the `eol` column that proves no row was cut. An export from
+  another tool that cuts long commands is read as it is, and a reference past the cut is not seen.
+- A step command with thousands of job-name filters on `sysjobs` can take many seconds to scan,
+  not only one with many `NOT EXISTS` lookups. In a test, 3000 `WHERE j.name = 'x'` filters in a
+  180,000 character command took 5.9 seconds.
+- On Windows, a reader that quits early on the report pipe can end the run in a traceback with
+  exit 1. This was not reproduced, because the report is small. Read the report from a file when
+  the code matters.
+- A hand-written Linux-style mail row with a platform name other than Linux, such as the
+  `mssql-conf` example above, is accepted and exits 0. Nothing checks that the profile exists.
 - A reader that quits early (`| head -1`) ends the report output without a traceback. The exit
   code is still the gate result, but the shell reports the code of the last command in the pipe.
   A reader that quits early on `--self-test` output prints a traceback; only the report path is
@@ -700,13 +710,9 @@ Failure alerts
 - The legacy `@email_profile` finding text was checked on SQL Server 2022 only.
 - The mail SELECT turns a registry value it could not read into `use_databasemail` 0. If the
   registry error does not reach the output file, `MAIL_NEVER_SENDS` can be a false positive.
-- An operator `email_address` that holds only spaces counts as an address, so a job that notifies
-  that operator is not flagged `NO_FAILURE_ALERT`.
 - The report is plain text and prints names as they are. Do not paste it into a spreadsheet.
 - Do not open the exports in a spreadsheet, including cells that start with a tab or a carriage
   return.
-- A job id that differs only in letter case between two exports is read as a different job, and
-  the run exits 2.
 - An empty steps export, with a header and no rows, is read as "no job has steps" and fails every
   job with `START_MISSING`. Check that the steps query ran against the right server.
 - A single apostrophe outside a T-SQL string, for example in a CmdExec or PowerShell step, shifts
