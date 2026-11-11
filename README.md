@@ -1,7 +1,7 @@
 # stepflow
 
-Flag SQL Server Agent job steps that never run, watchdogs that find their job by name, and runs
-far past their normal duration, from exported `msdb` rows.
+Flag SQL Server Agent job steps that never run, watchdogs that find their job by name, runs far
+past their normal duration, and jobs that tell nobody when they fail, from exported `msdb` rows.
 
 A nightly job refreshed a reporting table in one step. That step was set to quit the job
 reporting success. Later, someone used a script to append a second step that rebuilt a helper
@@ -14,6 +14,11 @@ watchdog did nothing, and it also reported Succeeded every time.
 
 Then a run hung for more than a hundred times its normal duration. When it ended, the history
 recorded it as Succeeded, like every other night.
+
+Then a job did fail, for real, and nobody heard of it. It had no operator set for a failure.
+Someone had tried to fix that years before. A script set the Agent mail profile with the
+`@email_profile` parameter of `sp_set_sqlagent_properties`, which is the SQL Mail parameter. SQL
+Mail is gone, so the call stored no profile, and Agent never sent a mail.
 
 Nothing failed, so nothing alerted. Each of these faults is visible in `msdb`, if something
 reads the rows. stepflow reads them offline, from exports, and names each fault.
@@ -30,6 +35,25 @@ PASS  a step appended after a step that quits reporting success is UNREACHABLE  
 PASS  and the finding names the step before it and its success action
 ...
 PASS  go to the next step on the last step is DANGLING: Agent fails the job there  <-- pinned defect
+...
+PASS  a job nobody hears a failure of is NO_FAILURE_ALERT, and it fails the gate  <-- pinned defect
+...
+PASS  Agent mail that was never enabled never sends, and the finding names the obsolete @email_profile parameter  <-- pinned defect
+...
+PASS  a Linux export is MAIL_UNCHECKED, not a false MAIL_NEVER_SENDS: the registry does not hold the Linux profile  <-- pinned defect
+...
+PASS  a job with no row in the notify export is refused, not judged on settings that were never read  <-- pinned defect
+PASS  a header-only notify export is refused, not read as clean  <-- pinned defect
+...
+PASS  dead mail is one finding, not one per job: every job names an operator, and the cause is filed once
+...
+PASS  a hand-written Windows mail row with a profile and use_databasemail 0 exits 1, and the finding names the profile  <-- pinned defect
+PASS  a mistyped profile name exits 1  <-- pinned defect
+PASS  database mail XPs off exits 1  <-- pinned defect
+...
+PASS  a steps export with no header row does not echo its first command to stderr  <-- pinned defect
+...
+PASS  the real exports: eight jobs tell nobody, and the run exits 1
 ...
 PASS  a start step that was deleted is START_MISSING  <-- pinned defect
 ...
@@ -64,10 +88,10 @@ PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the footer counts a failure and exits 1 on it
 PASS  the file imports as a module without running main
 --------------------------------------------------------------------
-233 assertions, 0 failed
+319 assertions, 0 failed
 ```
 
-The full run prints all 233 assertions. Each `...` line marks a cut in this block.
+The full run prints all 319 assertions. Each `...` line marks a cut in this block.
 
 ## What already exists
 
@@ -81,11 +105,25 @@ The full run prints all 233 assertions. Each `...` line marks a cut in this bloc
 - **dbachecks** (`LongRunningJob` and `LastJobRunTime`). It compares a running job, and a job's
   last run, with that job's average duration over a live connection. The default threshold is
   50 percent over the average. It is a good fit for a team that already runs Pester checks.
+  It also has Pester checks named "Agent Mail Profile", "Database Mail Profile", "DBA Operators"
+  and "Failsafe Operator" (`source/checks/Agent.Tests.ps1`). The Agent Mail Profile check reads
+  the live Agent profile over a connection and compares it with the profile name you set in
+  `agent.databasemailprofile`. It needs a connection, and a Pester setup that stepflow does not.
+- **sp_Blitz** (Brent Ozar's First Responder Kit, `sp_Blitz.sql`). CheckID 94, "Agent Jobs
+  Without Failure Emails", lists an enabled job whose e-mail, net send and pager operator ids are
+  all 0, and skips the Report Server category (100). CheckID 31, "No Operators Configured/Enabled",
+  fires when no operator is enabled. It runs on a live server and is a good first look at one. It
+  counts a job as covered when any operator id is set, so it does not see a level of "on success
+  only", a disabled operator or a blank address. The script has no check for the Agent mail
+  profile: a search for `UseDatabaseMail` and `DatabaseMailProfile` finds nothing.
 
 stepflow does not need a connection. It walks the whole step graph from the start step, so a
 step behind another unreachable step is reported too. It resolves every job that a string literal in a
 step command names. It times each run against a median, not an average, because one hung run inflates an
-average and hides the next one.
+average and hides the next one. For alerts, it reads a job's notify level and operator together
+with the operator row, so a disabled operator, a blank address or a level of "on success only"
+counts as no notification. It also reads the Agent mail setting from an export, so it can still
+say that mail never sends.
 
 The name `stepflow` is also used by unrelated GitHub projects: a macro-step library, a workflow
 engine and an AWS Step Functions dashboard. None of them reads SQL Server Agent.
@@ -95,9 +133,10 @@ engine and an AWS Step Functions dashboard. None of them reads SQL Server Agent.
 Python 3.9 or newer and nothing else. No database driver, no third-party package, no network.
 You run the SELECTs yourself with `sqlcmd` and give stepflow the CSV files.
 
-The same 233 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
+The same 319 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
 (Python 3.9.25). The three runs print the same text, except that Windows ends each line with
-CR LF. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`).
+CR LF. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1405
+statements, 348 branches). The code compiles with `python -W error` and passes `pyflakes`.
 
 ```
 git clone https://github.com/uhsear/stepflow.git
@@ -111,15 +150,23 @@ git clone https://github.com/uhsear/stepflow.git
 
 **The steps export is as sensitive as `msdb`.** It holds the full text of every job step
 command, and CmdExec, SSIS and PowerShell steps often carry a password or a connection
-string (for example `sqlcmd -P`). stepflow never prints a command, but the CSV file holds
+string (for example `sqlcmd -P`). stepflow never prints a command (an error names at most twelve
+header cells, and only a cell that looks like a column name), but the CSV file holds
 it. Keep `steps.csv` out of any repository and any ticket. `.gitignore` lists the file names
 used here, but a different name is not covered. Delete the exports when the run is done.
+
+The operators export holds the e-mail and pager address of every operator. Treat it the same
+way. stepflow prints an operator name, never an address. No SELECT reads a password: `sp_get_sqlagent_properties` returns a `host_login_password`
+column, so the mail SELECT reads two registry values, one `msdb` table and one configuration row, and does not call it.
 
 ```
 python stepflow.py --sql jobs > jobs.sql
 python stepflow.py --sql steps > steps.sql
 python stepflow.py --sql history > history.sql
 python stepflow.py --sql activity > activity.sql
+python stepflow.py --sql notify > notify.sql
+python stepflow.py --sql operators > operators.sql
+python stepflow.py --sql mail > mail.sql
 
 sqlcmd -S <server> -d msdb -y 0 -f o:65001 -i steps.sql -o steps.csv
 
@@ -127,6 +174,7 @@ python stepflow.py --jobs jobs.csv --steps steps.csv
 python stepflow.py --jobs jobs.csv --history history.csv --activity activity.csv
 python stepflow.py --jobs jobs.csv --history history.csv --baseline-before 2026-09-01
 python stepflow.py --jobs jobs.csv --steps steps.csv --report stepflow.txt --apply
+python stepflow.py --jobs jobs.csv --notify notify.csv --operators operators.csv --mail mail.csv
 ```
 
 | Flag | Default | What it does |
@@ -135,17 +183,22 @@ python stepflow.py --jobs jobs.csv --steps steps.csv --report stepflow.txt --app
 | `--steps` | off | The `sysjobsteps` export. Turns on the step flow and job reference checks. |
 | `--history` | off | The `sysjobhistory` export. Turns on the duration and green-over-failure checks. |
 | `--activity` | off | The `sysjobactivity` export. Times the runs that are still going. |
+| `--notify` | off | The `sysjobs` notification columns. Turns on the failure alert check. Needs `--operators`. |
+| `--operators` | off | The `sysoperators` export. Needs `--notify`. |
+| `--mail` | off | The Agent mail setting export. Checks the Agent mail setting. It reads no job and no notify export. It still needs `--jobs`. |
 | `--factor` | `10` | A run longer than this many times the median is flagged. Must be more than 1 and finite. |
 | `--min-runs` | `5` | The fewest other successful runs a median is taken from. |
 | `--min-seconds` | `300` | A run shorter than this is never flagged, whatever its ratio. Must be 0 or more and finite. |
 | `--baseline-before` | off | Take the median only from runs that started before this date, `YYYY-MM-DD`. |
 | `--report` | off | Write the report to this file. Needs `--apply`. It cannot name an input export. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
-| `--sql` | off | Print the SELECT for `jobs`, `steps`, `history` or `activity`, and exit. |
+| `--sql` | off | Print the SELECT for `jobs`, `steps`, `history`, `activity`, `notify`, `operators` or `mail`, and exit. |
 | `--self-test` | off | Run the assertions and exit. It writes fixtures to a temporary directory and removes it. |
 
-Give `--jobs` and at least one other export. Take all the exports at the same time. An export
-that names a job id that is not in the jobs export exits 2.
+Give `--jobs` and at least one other export (`--notify` and `--operators` count as one, and
+`--mail` needs no other export, but it still needs `--jobs`). Take all the exports at the same time. An export that names a job id that
+is not in the jobs export exits 2. A notify export must have a row for every job in the jobs
+export, so a job created or deleted between the two exports exits 2.
 
 ### The SQL, and why `-y 0`
 
@@ -194,9 +247,12 @@ of the machine that runs stepflow.
 | `GREEN_OVER_FAILED_STEP` | fail | A run reads as Succeeded, and a step failed in it. A step that is meant to fail and go on to a clean-up step fails the gate on every run. |
 | `FAR_PAST_NORMAL` | fail | A finished run took more than `--factor` times the median of the job's other successful runs. |
 | `RUNNING_PAST_NORMAL` | fail | A run that is still going has run longer than that. |
+| `NO_FAILURE_ALERT` | fail | An enabled job that no operator hears a failure of. See "Failure alerts". |
+| `MAIL_NEVER_SENDS` | fail | The Agent mail setting cannot send. See "Failure alerts". |
 | `FAIL_CAN_END_GREEN` | warn | When this step fails, the job goes on to a step, and a path from there quits reporting success. |
 | `NAME_BOUND` | warn | A step command finds a job by its name. It works today, and a rename disarms it. |
 | `NO_BASELINE` | warn | Some runs were not timed, because the job has too few successful runs to take a median from, or the job has no finished run in the history export. |
+| `MAIL_UNCHECKED` | warn | The mail setting was not read: no `--mail` export, or the export came from SQL Server on Linux. |
 
 A step that never runs is reported once, as `UNREACHABLE`. Its own routes cannot fire, so they
 are not reported as well.
@@ -233,6 +289,132 @@ self-test pin what stepflow does with each case, not what Agent does.
 
 Microsoft documents that `sp_delete_jobstep` "automatically updates the other job steps that
 reference the deleted step". It does not document what the update is. The table above shows it.
+
+### Failure alerts
+
+A job tells an operator about a failure through two settings that work together. The job holds a
+notify level and an operator id for each channel. Agent also needs a working mail setting. The
+`notify` and `operators` exports carry the first part, and the `mail` export carries the second.
+
+`NO_FAILURE_ALERT` names an enabled job when no channel notifies an operator on failure. A
+channel notifies when all of these are true. The level is 2 (on failure) or 3 (on completion).
+An operator id is set and the operator is in the export. The operator is enabled. The operator has
+an e-mail address (for the e-mail channel) or a pager address and a non-zero `pager_days` (for the
+pager channel). One working channel is enough. The finding names why each set channel does not
+work. A disabled job is skipped, because it does not run.
+
+Net send never counts. Microsoft documents the net send address of an operator as "Not
+supported", so a job that only uses net send is flagged.
+
+`MAIL_NEVER_SENDS` reads the Agent mail setting, and each finding says what to set.
+
+| Platform | `use_databasemail` | Profile | Verdict |
+|---|---|---|---|
+| Windows | not 1 (a missing value reads as 0) | any | `MAIL_NEVER_SENDS`. Names the legacy `@email_profile` parameter. Names the profile when the export has one. |
+| Windows | 1 | none | `MAIL_NEVER_SENDS`. Database Mail is selected, and no profile is set. |
+| Windows | 1 | a Database Mail profile, and the export says the profile is in `msdb` and `Database Mail XPs` is on | No finding. |
+| Windows | 1 | a Database Mail profile, and the export says the profile is not in `msdb` | `MAIL_NEVER_SENDS`. Names the profile. |
+| Windows | 1 | a Database Mail profile, and the export says `Database Mail XPs` is 0 | `MAIL_NEVER_SENDS`. |
+| Windows | 1 | a Database Mail profile, and the export does not carry the `profile_exists` and `database_mail_xps` columns, or leaves one empty | `MAIL_UNCHECKED`. The run cannot tell whether mail sends. |
+| Linux | any | any | `MAIL_UNCHECKED`. See "Linux keeps the profile elsewhere" below. |
+
+A story that fits the first row: someone runs `sp_set_sqlagent_properties @email_profile = N'...'`.
+The call succeeds and changes nothing, so `use_databasemail` stays 0 and the finding fires.
+
+The mail finding is one finding for the Agent, not one per job. A job that names a good operator is
+not flagged as well, because the cause is the mail setting, and a second finding for each job
+would bury it.
+
+The `notify`, `operators` and `mail` exports of the SQL Server 2022 container (12 synthetic jobs,
+5 synthetic operators) give this report. The Windows and Ubuntu runs print the same text.
+
+```
+$ python stepflow.py --jobs jobs.csv --notify notify.csv --operators operators.csv --mail mail.csv
+stepflow: 12 job(s), 0 step(s), 0 history row(s), 0 activity row(s), 12 notify row(s), 5 operator(s)
+checked: failure alerts, agent mail
+
+FAIL  NO_FAILURE_ALERT       sf blank address: no operator is told when this job fails: e-mail notifies operator 'sf blank "quoted", op', which has no e-mail address.
+FAIL  NO_FAILURE_ALERT       sf disabled operator: no operator is told when this job fails: e-mail notifies operator 'sf off duty', which is disabled.
+FAIL  NO_FAILURE_ALERT       sf level no operator: no operator is told when this job fails: no notification channel is set.
+FAIL  NO_FAILURE_ALERT       sf netsend: no operator is told when this job fails: net send is set, and SQL Server documents the net send address of an operator as not supported.
+FAIL  NO_FAILURE_ALERT       sf no operator: no operator is told when this job fails: no notification channel is set.
+FAIL  NO_FAILURE_ALERT       sf orphan operator: no operator is told when this job fails: e-mail notifies operator id 99, which is not in the operators export.
+FAIL  NO_FAILURE_ALERT       sf pager never: no operator is told when this job fails: pager notifies operator 'sf pager never', which is never available for pages (pager_days is 0).
+FAIL  NO_FAILURE_ALERT       sf success only: no operator is told when this job fails: the e-mail notify level is 'on success only'.
+WARN  MAIL_UNCHECKED         (SQL Server Agent): this export came from SQL Server on Linux. There the Agent mail profile is set in mssql.conf (sqlagent.databasemailprofile), and the export cannot read it. Check that setting by hand.
+
+VERDICT: 8 finding(s) fail the gate, 1 warning(s).
+```
+
+What was checked, and where:
+
+- **The profile and the XPs option are read too.** The `mail` SELECT counts the rows of
+  `msdb.dbo.sysmail_profile` that carry the profile name, and reads `value_in_use` of
+  `Database Mail XPs` from `sys.configurations`. Microsoft: "`0` (default): Database Mail isn't
+  available." `sys.configurations` documents `value_in_use` as the "Running value currently in
+  effect". `msdb.dbo.sysmail_profile` is not documented on Microsoft Learn as a table. It is the
+  table that the documented `sysmail_help_profile_sp` selects from, which the container showed
+  with `sp_helptext`. Both reads ran on the Linux container (SQL Server 2022 CU27), and the
+  export read `Linux,1,"",0,0`. A profile that exists was not run there, because the container
+  has no Database Mail profile. The profile test is a name match, so it follows the `msdb`
+  collation. It does not check that the profile has an account, that the account can reach a
+  mail server, or that Agent may use the profile.
+- **The mail setting is read from two registry values.** The `mail` SELECT calls
+  `master.dbo.xp_instance_regread` for `UseDatabaseMail` and `DatabaseMailProfile` under
+  `SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent`. `xp_instance_regread` is not documented on
+  Microsoft Learn. The names and the key come from the text of `sp_set_sqlagent_properties` in
+  `msdb` on SQL Server 2022 CU27 (16.0.4315.2), where `@use_databasemail` and
+  `@databasemail_profile` write those two values with `xp_instance_regwrite`. The SELECT ran
+  there, on Linux. It was not run on Windows, so the Windows registry path rests on that
+  procedure text.
+- **The legacy parameter stores nothing.** In that procedure text, `@email_profile` appears once,
+  in the parameter list, with the comment "obsolete - SQLMail profile, Rely on DBMail for
+  notifications". Nothing in the body reads it. No `msdb` module on that build contains an
+  `EmailProfile` registry value, and `sp_get_sqlagent_properties` returns `email_profile` as NULL
+  with the comment "Obsolete". Run in the container, `sp_set_sqlagent_properties @email_profile =
+  N'Old Profile'` returned without an error, and `UseDatabaseMail` (1) and `DatabaseMailProfile`
+  (NULL) read the same before and after. On Linux the registry values are emulated, so the run
+  shows that the call is accepted and ignored. It does not show the Windows registry.
+  stepflow therefore cannot see a legacy profile in an export. It sees that Agent mail is not
+  enabled, and the finding names the parameter as a likely cause.
+- **SQL Mail is gone.** Microsoft lists "SQL Mail" under discontinued features in SQL Server 2012,
+  with Database Mail as the replacement. The Alert System page of the Agent properties offers
+  only Database Mail as the mail system, and says a change of mail system needs an Agent restart.
+  An export shows the stored setting, not what a running Agent loaded. If someone changed the
+  setting and did not restart Agent, the export is ahead of the running service.
+- **Agent mail is required for notification.** Microsoft: "SQL Server Agent can be configured to
+  use Database Mail. This is required for alert notifications and automatic notification when a
+  job completes."
+- **What Agent does with no profile.** On the Linux container (SQL Server 2022 CU27), a job with
+  an enabled operator and `notify_level_email` of 2 failed on purpose. No Database Mail profile
+  was set. The job history row read "The job failed. ... NOTE: Failed to notify 'sf ops' via
+  email." The Agent log read "The mail profile is not specified" and "Unable to send job
+  completion notification email to operator". Database Mail XPs were also off in that container,
+  and the log shows that error too, so the run shows that no mail went out, not which of the two
+  causes stopped it.
+- **Linux keeps the profile elsewhere.** On Linux, Microsoft's mssql-conf page sets the Agent
+  profile with `mssql-conf set sqlagent.databasemailprofile`. In the container,
+  `xp_instance_regread` returned `UseDatabaseMail` 1 and no profile, and
+  `xp_instance_regwrite` of `DatabaseMailProfile` read back as NULL. A registry read of a Linux
+  server would call a working server broken. So the `mail` SELECT writes a `platform` column
+  from `@@VERSION`, and a Linux export is `MAIL_UNCHECKED`, a warning that asks for a manual look.
+  The self-test pins this. To check a Linux server, write the row by hand with the profile from
+  `mssql.conf`, for example `mssql-conf,1,"default",1,1,$` under the header `platform,use_databasemail,
+  databasemail_profile,profile_exists,database_mail_xps,eol`, and give any platform name except
+  `Linux`. Set the last two values from what you know of the profile and of Database Mail.
+- **A level without an operator is not stored.** `sp_update_job @notify_level_email = 2` with no
+  operator name printed no error. The next export showed level 0 and operator 0. stepflow still
+  reads level 2 with operator 0 as a gap, in case another tool wrote it.
+- **The export rows.** The `notify`, `operators` and `mail` SELECTs ran with `sqlcmd -y 0 -f
+  o:65001` in that container, against 12 synthetic jobs and 5 synthetic operators. The self-test
+  holds those exports as fixtures. The same exports give the same report on Windows (Python 3.13)
+  and on Ubuntu (Python 3.12).
+- **A permission error stops the run.** A login with no `SELECT` on `msdb.dbo.sysjobs` got
+  "The SELECT permission was denied on the object 'sysjobs'" in the output file, because `sqlcmd`
+  writes errors to the same stream as the rows. stepflow read that file as the notify export,
+  found no column, and exited 2. The mail SELECT ran for the same login in the container, which
+  has no Windows registry, so how Windows treats a login that is not a sysadmin was not tested.
+  Run the three SELECTs as a sysadmin.
 
 ### Job references
 
@@ -380,14 +562,63 @@ Exports and output
   which is refused. It does not ask first.
 - A job or step name that the output code page cannot encode prints with a `?`, so the report
   does not crash. Set `PYTHONUTF8=1` to print it whole.
-- An error message that quotes a cell cuts it to 32 characters, so a shifted column does not
-  copy file content into a log. The cut is a safeguard, not a guarantee. Treat the exports and
+- An error message that quotes a cell cuts it to 32 characters, and the header list of an error
+  names only cells that look like column names, so a shifted column or a file with no header
+  row does not copy a step command into a log. A shifted column can still put 28 characters of
+  a command on stderr. The cut is a safeguard, not a guarantee. Treat the exports and
   the report as sensitive.
+- A job or step name that holds a line break or a terminal escape code prints as it is. Read the
+  last `VERDICT` line, not the first.
+- The check that `--report` does not name an input compares paths, not files, so a symlink or
+  hard link to an export is not caught.
 - A reader that quits early (`| head -1`) ends the output without a traceback. The exit code
   is still the gate result, but the shell reports the code of the last command in the pipe.
 
+Failure alerts
+- The step, history and activity run shown above came from exports that are not shipped, so a
+  reader cannot repeat it. The self-test pins each check on synthetic rows instead.
+- The behaviour table was run on build 16.0.4295.3, and the mail checks on 16.0.4315.2
+  (CU27-GDR).
+- The statement that `@email_profile` stores nothing rests on SQL Server 2022 CU27 only. Older
+  builds were not read, and Microsoft's page for `sp_set_sqlagent_properties` was not
+  available to cite.
+- A mail export from an older stepflow has no `profile_exists` and `database_mail_xps` columns.
+  It gets `MAIL_UNCHECKED` for a Windows profile, not a clean result. The mail check never
+  tests that the profile has an account, that the mail server answers, or that a message can
+  be sent. A mail failure of that kind still passes it.
+- The `profile_exists` and `database_mail_xps` reads were not run on Windows. A login that
+  cannot read the registry value or the `msdb` table may get a row that says `use_databasemail`
+  0, so read a permission error there as "not enabled". Run the SELECTs as a sysadmin.
+- A hand-written mail row with an empty or unknown `platform` is read as Windows. A hand-written
+  profile cell of the text `NULL` is read as a profile named NULL.
+- A server that sends all its mail from job steps, and never through Agent notification, still
+  gets `MAIL_NEVER_SENDS` when Agent mail is off.
+- Without `--mail`, a run with no `NO_FAILURE_ALERT` finding exits 0 and only warns that the mail
+  setting was not read. A Linux export is the same: `MAIL_UNCHECKED` exits 0. A scheduled check
+  that watches only the exit code passes these runs, so it must also read the `WARN` lines.
+- The `net send` wording of a finding can name net send when only an operator id is set, and
+  the level is 0. The verdict is still right.
+- It reads only the notify settings of the job itself. A job whose own step sends the mail (a
+  `sp_send_dbmail` call in a clean-up step, for example) is flagged `NO_FAILURE_ALERT`, although
+  its failure does tell someone. Microsoft says a job step can send e-mail without Agent mail.
+  An Agent alert, a monitoring tool or a ticket system that watches the history is not seen
+  either. There is no allow list: filter the job out of the jobs and notify exports together.
+- A job that no operator hears is flagged even when you chose that, such as a job of the Report
+  Server category (100). sp_Blitz skips that category. stepflow does not read the category.
+- `pager_days` is a bitmask of the days an operator takes pages. stepflow tests only that it is
+  not 0. It does not read the pager start and end times, so a page can still fall outside them.
+- The `use_databasemail` and profile values are the stored setting. An Agent that was not
+  restarted after a change still runs the old one.
+- The Windows branch of the `mail` SELECT was not run: no Windows SQL Server was available. Its
+  registry key comes from the text of `sp_set_sqlagent_properties`. Azure SQL Managed Instance, which fixes its own profile
+  name, was not tested.
+- A Linux server is `MAIL_UNCHECKED`, a warning that exits 0. The run cannot tell a working
+  Linux Agent from a broken one.
+- `notify_level_eventlog` (the Windows event log) is not read, because a log line tells no one.
+
 Scope
-- It does not read schedules, alerts, operators, or multiserver (master and target) jobs.
+- It does not read schedules, Agent alerts, or multiserver (master and target) jobs. It reads the
+  operators only to judge the notify settings of a job.
 - It does not read job step output files or the Agent error log.
 - The SQL and every behaviour in "What SQL Server Agent does" were tested on one build: SQL
   Server 2022 CU27 on Linux, with `sqlcmd` 18.6 (ODBC) from the same container. Windows
@@ -418,6 +649,28 @@ Scope
   `@new_name` and `@start_step_id`.
 - [Use Tokens in Job Steps](https://learn.microsoft.com/en-us/ssms/agent/use-tokens-in-job-steps):
   the `JOBID` and `JOBNAME` tokens, and the `ESCAPE_NONE` example for a job id.
+- [dbo.sysoperators](https://learn.microsoft.com/en-us/sql/relational-databases/system-tables/dbo-sysoperators-transact-sql):
+  `enabled`, `email_address`, `pager_address`, `pager_days`, and `netsend_address` as "Not supported".
+- [Database Mail](https://learn.microsoft.com/en-us/sql/relational-databases/database-mail/database-mail):
+  "Configure SQL Agent to use Database Mail ... This is required for alert notifications and
+  automatic notification when a job completes", and a job step can send e-mail on its own.
+- [Server Configuration: Database Mail XPs](https://learn.microsoft.com/en-us/sql/database-engine/configure-windows/database-mail-xps-server-configuration-option):
+  "`0` (default): Database Mail isn't available."
+- [sys.configurations](https://learn.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-configurations-transact-sql):
+  `value_in_use` as the "Running value currently in effect for this option".
+- [Database Mail Configuration Objects](https://learn.microsoft.com/en-us/sql/relational-databases/database-mail/database-mail-configuration-objects):
+  profiles live in `msdb`, and `sysmail_help_profile_sp` lists them.
+- [Configure SQL Server Agent Mail to Use Database Mail](https://learn.microsoft.com/en-us/sql/relational-databases/database-mail/configure-sql-server-agent-mail-to-use-database-mail):
+  enable the mail profile, then restart Agent.
+- [SQL Server Agent Properties (Alert System page)](https://learn.microsoft.com/en-us/ssms/agent/sql-server-agent-properties-alert-system-page):
+  "By default, SQL Server Agent Mail is not enabled", Database Mail as the mail system, and the
+  restart after a change.
+- [Discontinued Database Engine Functionality in SQL Server 2012](https://learn.microsoft.com/en-us/previous-versions/sql/sql-server-2012/ms144262(v=sql.110)):
+  SQL Mail, with "Use Database Mail" as the replacement.
+- [Configure SQL Server on Linux with mssql-conf](https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-configure-mssql-conf):
+  `sqlagent.databasemailprofile`.
+- [Notify an Operator of Job Status](https://learn.microsoft.com/en-us/ssms/agent/notify-an-operator-of-job-status):
+  the e-mail, pager and net send channels, and the "when the job fails" level.
 - [sqlcmd utility](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility): the `-y`
   default of 256, `-W` that "can't be used with the `-y` or `-Y` options", `-f` and `-u`.
 - [Resize the Job History Log](https://learn.microsoft.com/en-us/ssms/agent/resize-the-job-history-log):
@@ -426,7 +679,10 @@ Scope
   (SQLServerCentral, 2012): the one-hop check and the SSMS warning it reports.
 - [dbachecks](https://github.com/dataplat/dbachecks): `agent.longrunningjob.percentage` and
   `agent.lastjobruntime.percentage`, both 50, in `source/internal/configurations/configuration.ps1`,
-  and the average-based query in `source/internal/functions/Get-AllAgentInfo.ps1`.
+  the average-based query in `source/internal/functions/Get-AllAgentInfo.ps1`, and the "Agent
+  Mail Profile" check in `source/checks/Agent.Tests.ps1`.
+- [sp_Blitz](https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit): CheckID 94 and 31
+  in `sp_Blitz.sql`.
 
 ## Contributing
 

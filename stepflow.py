@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 """Flag SQL Server Agent job steps that never run, watchdogs that find their
-job by name, and runs far past their normal duration, from exported msdb rows.
+job by name, runs far past their normal duration, and jobs that tell nobody
+when they fail, from exported msdb rows.
 
 A job had one step that quit reporting success. Someone appended a second
 step with a script, and the first step still quit reporting success, so the
 second step never ran. The job stayed green. A watchdog job looked its target
 up by name and stopped it when it hung. The target was renamed, the watchdog
 found nothing to stop, and it stayed green too. A run that took more than a
-hundred times its normal duration went into the history as Succeeded.
+hundred times its normal duration went into the history as Succeeded. A job
+had no operator set for a failure, and the Agent mail profile had been set with
+a legacy parameter that stores nothing, so no failure ever sent mail.
 
 SQL Server Management Studio warns about an unreachable step when the job is
 edited in its dialog, but a T-SQL edit gets no warning. A community script
@@ -16,12 +19,15 @@ a running job with its average duration over a live connection. This tool
 reads exported msdb rows offline, walks the whole step graph from the start
 step, resolves every job that a string literal in a step command names, and
 times each finished or running run against the median of the job's other
-successful runs.
+successful runs. It also reads the job notification columns, the operators and
+the Agent mail setting, and names each job that would tell nobody about a
+failure.
 
     python stepflow.py --self-test
     python stepflow.py --sql steps > steps.sql
     python stepflow.py --jobs jobs.csv --steps steps.csv
     python stepflow.py --jobs jobs.csv --history history.csv --activity activity.csv
+    python stepflow.py --jobs jobs.csv --notify notify.csv --operators operators.csv --mail mail.csv
     python stepflow.py --jobs jobs.csv --steps steps.csv --report out.txt --apply
 
 Nothing is written without --apply, except that --self-test writes fixtures
@@ -75,9 +81,16 @@ RUN_STATUS = {0: "Failed", 1: "Succeeded", 2: "Retry", 3: "Canceled",
 # Finding kinds, in report order. Every kind in GATE fails the run (exit 1).
 GATE = ("START_MISSING", "UNREACHABLE", "DANGLING", "FAIL_REPORTS_SUCCESS",
         "DISARMED", "GREEN_OVER_FAILED_STEP", "FAR_PAST_NORMAL",
-        "RUNNING_PAST_NORMAL")
-WARN = ("FAIL_CAN_END_GREEN", "NAME_BOUND", "NO_BASELINE")
+        "RUNNING_PAST_NORMAL", "NO_FAILURE_ALERT", "MAIL_NEVER_SENDS")
+WARN = ("FAIL_CAN_END_GREEN", "NAME_BOUND", "NO_BASELINE", "MAIL_UNCHECKED")
 KINDS = GATE + WARN
+
+# notify_level_* values (dbo.sysjobs): a bitmask, 1 on success and 2 on failure.
+LEVEL_WORDS = {0: "never", 1: "on success only", 2: "on failure",
+               3: "whenever the job completes"}
+
+# The name the mail findings are filed under: they belong to the Agent.
+AGENT = "(SQL Server Agent)"
 
 # The SELECTs that --sql prints. Each one builds its CSV line in T-SQL, so no
 # client setting can split a field: a command holds commas, quotes and line
@@ -129,6 +142,46 @@ SELECT line FROM (
   WHERE a.session_id = (SELECT MAX(s.session_id) FROM msdb.dbo.syssessions AS s)
 ) AS t ORDER BY k;
 """,
+    "notify": """SET NOCOUNT ON;
+SELECT line FROM (
+  SELECT 0 AS k, CAST(N'job_id,enabled,email_level,email_operator_id,page_level,page_operator_id,netsend_level,netsend_operator_id,eol' AS nvarchar(max)) AS line
+  UNION ALL
+  SELECT 1, CONCAT(CONVERT(char(36), j.job_id), N',', j.enabled, N',',
+                   j.notify_level_email, N',', j.notify_email_operator_id, N',',
+                   j.notify_level_page, N',', j.notify_page_operator_id, N',',
+                   j.notify_level_netsend, N',', j.notify_netsend_operator_id,
+                   N',$')
+  FROM msdb.dbo.sysjobs AS j
+) AS t ORDER BY k;
+""",
+    "operators": """SET NOCOUNT ON;
+SELECT line FROM (
+  SELECT 0 AS k, CAST(N'id,name,enabled,email_address,pager_address,pager_days,eol' AS nvarchar(max)) AS line
+  UNION ALL
+  SELECT 1, CONCAT(o.id, N',"', REPLACE(o.name, N'"', N'""'), N'",',
+                   o.enabled, N',"',
+                   REPLACE(ISNULL(o.email_address, N''), N'"', N'""'), N'","',
+                   REPLACE(ISNULL(o.pager_address, N''), N'"', N'""'), N'",',
+                   o.pager_days, N',$')
+  FROM msdb.dbo.sysoperators AS o
+) AS t ORDER BY k;
+""",
+    "mail": """SET NOCOUNT ON;
+DECLARE @use int, @dbmail nvarchar(255), @found int, @xps int;
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\MSSQLServer\\SQLServerAgent', N'UseDatabaseMail', @use OUTPUT, N'no_output';
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\MSSQLServer\\SQLServerAgent', N'DatabaseMailProfile', @dbmail OUTPUT, N'no_output';
+SELECT @found = COUNT(*) FROM msdb.dbo.sysmail_profile WHERE name = @dbmail;
+SELECT @xps = CONVERT(int, value_in_use) FROM sys.configurations WHERE name = N'Database Mail XPs';
+SELECT line FROM (
+  SELECT 0 AS k, CAST(N'platform,use_databasemail,databasemail_profile,profile_exists,database_mail_xps,eol' AS nvarchar(max)) AS line
+  UNION ALL
+  SELECT 1, CONCAT(CASE WHEN @@VERSION LIKE N'%on Linux%' THEN N'Linux' ELSE N'Windows' END,
+                   N',', ISNULL(@use, 0), N',"',
+                   REPLACE(ISNULL(@dbmail, N''), N'"', N'""'), N'",',
+                   CASE WHEN @found > 0 THEN 1 ELSE 0 END, N',',
+                   ISNULL(@xps, 0), N',$')
+) AS t ORDER BY k;
+""",
 }
 
 COLUMNS = {
@@ -140,6 +193,12 @@ COLUMNS = {
                 "run_time", "run_duration"),
     "activity": ("job_id", "start_execution_date", "stop_execution_date",
                  "exported_at"),
+    "notify": ("job_id", "enabled", "email_level", "email_operator_id",
+               "page_level", "page_operator_id", "netsend_level",
+               "netsend_operator_id"),
+    "operators": ("id", "name", "enabled", "email_address", "pager_address",
+                  "pager_days"),
+    "mail": ("platform", "use_databasemail", "databasemail_profile"),
 }
 
 
@@ -185,6 +244,41 @@ class Activity(object):
         self.exported_at = exported_at
 
 
+class Notify(object):
+    """One job's notification settings. Each channel is (level, operator id)."""
+
+    def __init__(self, job_id, enabled, email=(0, 0), page=(0, 0),
+                 netsend=(0, 0)):
+        self.job_id = job_id.lower()
+        self.enabled = enabled
+        self.channels = (("e-mail", email), ("pager", page),
+                         ("net send", netsend))
+
+
+class Operator(object):
+    def __init__(self, op_id, name, enabled=1, email_address="",
+                 pager_address="", pager_days=0):
+        self.op_id = op_id
+        self.name = name
+        self.enabled = enabled
+        self.email_address = email_address.strip()
+        self.pager_address = pager_address.strip()
+        self.pager_days = pager_days
+
+
+class Mail(object):
+    """The Agent mail setting as the registry holds it."""
+
+    def __init__(self, platform, use_databasemail, databasemail_profile="",
+                 profile_exists=None, database_mail_xps=None):
+        self.platform = platform.strip()
+        self.use_databasemail = use_databasemail
+        self.databasemail_profile = databasemail_profile.strip()
+        # None means the export did not say. 0 or 1 is what the SELECT read.
+        self.profile_exists = profile_exists
+        self.database_mail_xps = database_mail_xps
+
+
 class Finding(object):
     def __init__(self, kind, job, text):
         self.kind = kind
@@ -197,10 +291,12 @@ class Finding(object):
 
 
 class Report(object):
-    def __init__(self, findings, counts, checked):
+    def __init__(self, findings, counts, checked, alert_counts=None):
         self.findings = findings
         self.counts = counts
         self.checked = checked
+        # (notify rows, operators) when the alert exports were given.
+        self.alert_counts = alert_counts
 
     @property
     def failing(self):
@@ -697,7 +793,116 @@ def analyse_activity(jobs, activity, baselines, factor=DEFAULT_FACTOR,
     return findings
 
 
-def check_tables(jobs, steps, history, activity):
+def channel_gap(channel, level, op_id, operators):
+    """(tells, why) for one notification channel of one job.
+
+    tells is True when the channel notifies an operator on failure. why says
+    what is wrong, and is empty when the channel was never set.
+    """
+    if (level, op_id) == (0, 0):
+        return False, ""
+    if channel == "net send":
+        # sysoperators documents netsend_address as "Not supported".
+        return False, ("net send is set, and SQL Server documents the net "
+                       "send address of an operator as not supported")
+    if level not in (2, 3):
+        return False, "the %s notify level is '%s'%s" % (
+            channel, LEVEL_WORDS[level],
+            ", and no operator is set" if op_id == 0 else "")
+    if op_id == 0:
+        return False, "the %s notify level is '%s', and no operator is set" % (
+            channel, LEVEL_WORDS[level])
+    op = operators.get(op_id)
+    if op is None:
+        return False, ("%s notifies operator id %d, which is not in the "
+                       "operators export" % (channel, op_id))
+    if not op.enabled:
+        return False, "%s notifies operator '%s', which is disabled" % (
+            channel, op.name)
+    if channel == "e-mail" and not op.email_address:
+        return False, "%s notifies operator '%s', which has no e-mail address" \
+            % (channel, op.name)
+    if channel == "pager" and not op.pager_address:
+        return False, "%s notifies operator '%s', which has no pager address" \
+            % (channel, op.name)
+    if channel == "pager" and not op.pager_days:
+        return False, ("%s notifies operator '%s', which is never available "
+                       "for pages (pager_days is 0)" % (channel, op.name))
+    return True, ""
+
+
+def analyse_alerts(jobs, notify, operators):
+    """NO_FAILURE_ALERT for each enabled job no operator hears a failure of."""
+    names = dict((j.job_id, j.name) for j in jobs)
+    by_id = dict((o.op_id, o) for o in operators)
+    findings = []
+    for row in notify:
+        if not row.enabled:
+            continue
+        results = [channel_gap(channel, level, op_id, by_id)
+                   for channel, (level, op_id) in row.channels]
+        if any(tells for tells, _ in results):
+            continue
+        why = [text for _, text in results if text]
+        findings.append(Finding(
+            "NO_FAILURE_ALERT", names[row.job_id],
+            "no operator is told when this job fails: %s." %
+            ("; ".join(why) if why else "no notification channel is set")))
+    return findings
+
+
+def analyse_mail(mail):
+    """MAIL_NEVER_SENDS or MAIL_UNCHECKED for the Agent mail setting."""
+    if mail.platform.lower() == "linux":
+        return [Finding(
+            "MAIL_UNCHECKED", AGENT,
+            "this export came from SQL Server on Linux. There the Agent mail "
+            "profile is set in mssql.conf (sqlagent.databasemailprofile), and "
+            "the export cannot read it. Check that setting by hand.")]
+    if mail.use_databasemail != 1:
+        return [Finding(
+            "MAIL_NEVER_SENDS", AGENT,
+            "Agent mail is not enabled: use_databasemail is %d%s. Agent sends "
+            "no job or alert notification. A profile set with the "
+            "@email_profile parameter of sp_set_sqlagent_properties is "
+            "stored nowhere: that parameter is obsolete, and SQL Mail was "
+            "discontinued in SQL Server 2012. Set @use_databasemail = 1 and "
+            "@databasemail_profile, then restart Agent."
+            % (mail.use_databasemail,
+               ", and the profile '%s' is set" % mail.databasemail_profile
+               if mail.databasemail_profile else ""))]
+    if not mail.databasemail_profile:
+        return [Finding(
+            "MAIL_NEVER_SENDS", AGENT,
+            "Database Mail is selected for Agent and no mail profile is "
+            "set. Agent sends no job or alert notification. Set "
+            "@databasemail_profile, then restart Agent.")]
+    if mail.profile_exists is None or mail.database_mail_xps is None:
+        return [Finding(
+            "MAIL_UNCHECKED", AGENT,
+            "this export does not say whether the profile '%s' exists in "
+            "msdb or whether the 'Database Mail XPs' option is on. Agent "
+            "sends nothing if either is missing. Print the mail SELECT "
+            "again with --sql mail, or check both by hand."
+            % mail.databasemail_profile)]
+    findings = []
+    if not mail.profile_exists:
+        findings.append(Finding(
+            "MAIL_NEVER_SENDS", AGENT,
+            "the Agent mail profile '%s' is not in "
+            "msdb.dbo.sysmail_profile. Agent sends no job or alert "
+            "notification. Check the spelling, or create the profile."
+            % mail.databasemail_profile))
+    if not mail.database_mail_xps:
+        findings.append(Finding(
+            "MAIL_NEVER_SENDS", AGENT,
+            "the 'Database Mail XPs' option is 0. Database Mail is not "
+            "available, so Agent sends no job or alert notification. Turn "
+            "the option on with sp_configure."))
+    return findings
+
+
+def check_tables(jobs, steps, history, activity, notify=(), operators=()):
     """Refuse exports that disagree with each other. Raises ValueError."""
     ids = set()
     for job in jobs:
@@ -707,7 +912,7 @@ def check_tables(jobs, steps, history, activity):
         ids.add(job.job_id)
     keys = set()
     for name, rows in (("steps", steps), ("history", history),
-                       ("activity", activity)):
+                       ("activity", activity), ("notify", notify)):
         for row in rows:
             if row.job_id not in ids:
                 raise ValueError(
@@ -721,11 +926,29 @@ def check_tables(jobs, steps, history, activity):
             raise ValueError("job id %s has step %d twice in the steps "
                              "export" % key)
         keys.add(key)
+    seen = set()
+    for row in notify:
+        if row.job_id in seen:
+            raise ValueError("job id %s is in the notify export twice"
+                             % row.job_id)
+        seen.add(row.job_id)
+    if notify and seen != ids:
+        raise ValueError(
+            "the notify export has no row for job id %s. Take every export "
+            "at the same time, so a job is not judged on notification "
+            "settings that were never read." % sorted(ids - seen)[0])
+    op_ids = set()
+    for op in operators:
+        if op.op_id in op_ids:
+            raise ValueError("operator id %d is in the operators export "
+                             "twice" % op.op_id)
+        op_ids.add(op.op_id)
 
 
 def build_report(jobs, steps=None, history=None, activity=None,
                  factor=DEFAULT_FACTOR, min_runs=DEFAULT_MIN_RUNS,
-                 min_seconds=DEFAULT_MIN_SECONDS, baseline_before=None):
+                 min_seconds=DEFAULT_MIN_SECONDS, baseline_before=None,
+                 notify=None, operators=None, mail=None):
     """Run every check the supplied exports allow. None means not supplied."""
     if not jobs:
         raise ValueError("the jobs export has no rows, so nothing was "
@@ -735,7 +958,16 @@ def build_report(jobs, steps=None, history=None, activity=None,
         raise ValueError("the activity export has no rows, so no running "
                          "job could be seen. Check that SQL Server Agent is "
                          "running and that the export read the right server.")
-    check_tables(jobs, steps or [], history or [], activity or [])
+    if (notify is None) != (operators is None):
+        raise ValueError("the notify and operators exports are read "
+                         "together: an operator id means nothing without "
+                         "the operators.")
+    if notify is not None and not notify:
+        raise ValueError("the notify export has no rows, so no job was "
+                         "checked. Check the server, the database (msdb) "
+                         "and the permissions of the login that took it.")
+    check_tables(jobs, steps or [], history or [], activity or [],
+                 notify or [], operators or [])
     findings = []
     checked = []
     if steps is not None:
@@ -754,16 +986,32 @@ def build_report(jobs, steps=None, history=None, activity=None,
         checked.append("running jobs")
         findings.extend(analyse_activity(jobs, activity, baselines, factor,
                                          min_seconds))
+    alert_counts = None
+    if notify is not None:
+        checked.append("failure alerts")
+        findings.extend(analyse_alerts(jobs, notify, operators))
+        alert_counts = (len(notify), len(operators))
+    if mail is not None:
+        checked.append("agent mail")
+        findings.extend(analyse_mail(mail))
+    elif notify is not None:
+        findings.append(Finding(
+            "MAIL_UNCHECKED", AGENT,
+            "no --mail export was given, so a job that names an operator may "
+            "still send nothing: Agent sends no notification when its mail "
+            "profile is not set."))
     findings.sort(key=lambda f: (KINDS.index(f.kind), f.job.lower(), f.text))
     counts = (len(jobs), len(steps or []), len(history or []),
               len(activity or []))
-    return Report(findings, counts, checked)
+    return Report(findings, counts, checked, alert_counts)
 
 
 def describe(report):
-    lines = ["stepflow: %d job(s), %d step(s), %d history row(s), %d activity "
-             "row(s)" % report.counts,
-             "checked: %s" % ", ".join(report.checked), ""]
+    head = ("stepflow: %d job(s), %d step(s), %d history row(s), %d activity "
+            "row(s)" % report.counts)
+    if report.alert_counts is not None:
+        head += ", %d notify row(s), %d operator(s)" % report.alert_counts
+    lines = [head, "checked: %s" % ", ".join(report.checked), ""]
     for f in report.findings:
         lines.append("%s  %-22s %s: %s" % ("FAIL" if f.gate else "WARN",
                                            f.kind, f.job, f.text))
@@ -1421,6 +1669,187 @@ def self_test():
     check(lines[-1] == "VERDICT: no finding fails the gate, 0 warning(s)." and
           lines[-2] == "", "a clean run says so")
 
+    # ---- failure alerts: one channel
+    ops = [Operator(1, "ops", 1, "ops@example.invalid"),
+           Operator(2, "off duty", 0, "off@example.invalid"),
+           Operator(3, "blank", 1, "  "),
+           Operator(4, "pager never", 1, "", "pg@example.invalid", 0),
+           Operator(5, "pager ok", 1, "", "pg@example.invalid", 127),
+           Operator(6, "pager blank", 1, "", "", 127)]
+    by_op = dict((o.op_id, o) for o in ops)
+
+    def gap(channel, level, op_id):
+        return channel_gap(channel, level, op_id, by_op)
+
+    check(gap("e-mail", 2, 1) == (True, "") and gap("e-mail", 3, 1)[0],
+          "an operator with an address, told on failure or on completion, "
+          "hears the failure")
+    check(gap("e-mail", 0, 0) == (False, ""),
+          "a channel that was never set says nothing")
+    ok, why = gap("e-mail", 1, 1)
+    check(not ok and why == "the e-mail notify level is 'on success only'",
+          "a level of 1 tells the operator about success, not failure")
+    check("'never'" in gap("e-mail", 0, 1)[1],
+          "an operator with level 0 is never told")
+    check(gap("e-mail", 1, 0)[1] == "the e-mail notify level is 'on success "
+          "only', and no operator is set",
+          "a level that is too low and no operator say both")
+    check(gap("e-mail", 2, 0)[1] == "the e-mail notify level is 'on "
+          "failure', and no operator is set",
+          "a failure level with operator id 0 names the missing operator")
+    check("operator id 9, which is not in the operators export" in
+          gap("e-mail", 2, 9)[1], "an operator id that is not in sysoperators "
+          "is named")
+    check("'off duty', which is disabled" in gap("e-mail", 2, 2)[1],
+          "a disabled operator hears nothing")
+    check("which has no e-mail address" in gap("e-mail", 2, 3)[1],
+          "an operator whose address is blank hears nothing")
+    check(gap("pager", 2, 5) == (True, ""),
+          "a pager operator with an address and pager days hears the failure")
+    check("no pager address" in gap("pager", 2, 6)[1] and
+          "no pager address" in gap("pager", 2, 1)[1],
+          "a pager channel needs a pager address, not an e-mail address")
+    check("never available for pages (pager_days is 0)" in
+          gap("pager", 2, 4)[1],
+          "an operator with pager_days 0 is never paged")
+    check(not gap("net send", 2, 1)[0] and "not supported" in
+          gap("net send", 2, 1)[1] and not gap("net send", 3, 5)[0],
+          "net send never counts: sysoperators documents it as not "
+          "supported")
+
+    # ---- failure alerts: one job
+    ja, jb, jc, jd = ("0a0a0a0a-0000-4000-8000-00000000000%d" % i
+                      for i in (1, 2, 3, 4))
+    four = [Job(ja, "healthy", 1), Job(jb, "success only", 1),
+            Job(jc, "nothing set", 1), Job(jd, "retired", 1)]
+    found = analyse_alerts(four, [
+        Notify(ja, 1, email=(2, 1)),
+        Notify(jb, 1, email=(1, 1), page=(2, 4)),
+        Notify(jc, 1),
+        Notify(jd, 0)], ops)
+    check([f.job for f in found] == ["success only", "nothing set"] and
+          kinds(found) == ["NO_FAILURE_ALERT"] * 2 and found[0].gate,
+          "a job nobody hears a failure of is NO_FAILURE_ALERT, and it "
+          "fails the gate  <-- pinned defect")
+    check("the e-mail notify level is 'on success only'; pager notifies "
+          "operator 'pager never'" in found[0].text and
+          found[0].text.count("; ") == 1,
+          "a job with two broken channels names both, once each")
+    check(found[1].text == "no operator is told when this job fails: no "
+          "notification channel is set.",
+          "a job with no channel set says so")
+    check(not any(f.job == "retired" for f in found),
+          "a disabled job needs no alert, so it is not flagged")
+    check(analyse_alerts(four[:1], [Notify(ja, 1, email=(2, 99),
+                                           page=(3, 5))], ops) == [],
+          "one working channel is enough, whatever the others say")
+
+    # ---- failure alerts: the Agent mail setting
+    def mail_kinds(*args):
+        return kinds(analyse_mail(Mail(*args)))
+
+    check(mail_kinds("Windows", 1, "Ops mail", 1, 1) == [],
+          "database mail selected with a profile that exists and the XPs "
+          "on has no finding")
+    found = analyse_mail(Mail("Windows", 1, "Ops mail"))
+    check(kinds(found) == ["MAIL_UNCHECKED"] and not found[0].gate and
+          "'Ops mail'" in found[0].text and
+          "'Database Mail XPs'" in found[0].text,
+          "a profile name alone is not clean: an export that does not say "
+          "whether the profile exists or the XPs are on is MAIL_UNCHECKED  "
+          "<-- pinned defect")
+    check(mail_kinds("Windows", 1, "Ops mail", 1, None) ==
+          ["MAIL_UNCHECKED"] and
+          mail_kinds("Windows", 1, "Ops mail", None, 1) ==
+          ["MAIL_UNCHECKED"],
+          "one unknown check is enough to leave the verdict unchecked")
+    found = analyse_mail(Mail("Windows", 1, "no such profile", 0, 1))
+    check(kinds(found) == ["MAIL_NEVER_SENDS"] and found[0].gate and
+          "'no such profile' is not in msdb.dbo.sysmail_profile"
+          in found[0].text,
+          "a profile name that is not in msdb never sends  "
+          "<-- pinned defect")
+    found = analyse_mail(Mail("Windows", 1, "Ops mail", 1, 0))
+    check(kinds(found) == ["MAIL_NEVER_SENDS"] and found[0].gate and
+          "'Database Mail XPs' option is 0" in found[0].text,
+          "Database Mail XPs off never sends, whatever the profile  "
+          "<-- pinned defect")
+    check(mail_kinds("Windows", 1, "gone", 0, 0) ==
+          ["MAIL_NEVER_SENDS", "MAIL_NEVER_SENDS"],
+          "a missing profile and XPs off are both named")
+    found = analyse_mail(Mail("Windows", 0, ""))
+    check(kinds(found) == ["MAIL_NEVER_SENDS"] and found[0].gate and
+          found[0].job == AGENT and "Agent mail is not enabled: "
+          "use_databasemail is 0" in found[0].text and
+          "@email_profile" in found[0].text and "obsolete" in found[0].text
+          and "discontinued in SQL Server 2012" in found[0].text,
+          "Agent mail that was never enabled never sends, and the finding "
+          "names the obsolete @email_profile parameter  <-- pinned defect")
+    check(mail_kinds("Windows", 0, "Ops mail") == ["MAIL_NEVER_SENDS"],
+          "a Database Mail profile with use_databasemail 0 is not used")
+    found = analyse_mail(Mail("Windows", 1, "  "))
+    check(kinds(found) == ["MAIL_NEVER_SENDS"] and
+          "no mail profile is set" in found[0].text,
+          "Database Mail selected with no profile never sends")
+    found = analyse_mail(Mail("Linux", 1, ""))
+    check(kinds(found) == ["MAIL_UNCHECKED"] and not found[0].gate and
+          "mssql.conf" in found[0].text,
+          "a Linux export is MAIL_UNCHECKED, not a false MAIL_NEVER_SENDS: "
+          "the registry does not hold the Linux profile  <-- pinned defect")
+    check(mail_kinds(" LINUX ", 0, "") == ["MAIL_UNCHECKED"] and
+          mail_kinds(" windows ", 1, "p", 1, 1) == [],
+          "the platform is read ignoring case and spaces")
+
+    # ---- failure alerts: the tables together
+    raises(lambda: check_tables(four, [], [], [], [Notify(ja, 1)] * 2),
+           "a job twice in the notify export is refused")
+    raises(lambda: check_tables(four, [], [], [], [Notify(ja, 1)]),
+           "a job with no row in the notify export is refused, not judged "
+           "on settings that were never read  <-- pinned defect")
+    raises(lambda: check_tables(four[:1], [], [], [],
+                                [Notify(ja, 1), Notify(jb, 1)]),
+           "a notify row of a job that is not in the jobs export is refused")
+    raises(lambda: check_tables(four, [], [], [], (), [Operator(1, "a"),
+                                                       Operator(1, "b")]),
+           "an operator id twice in the operators export is refused")
+    all_rows = [Notify(j.job_id, 1, email=(2, 1)) for j in four]
+    check(check_tables(four, [], [], [], all_rows, ops) is None,
+          "a notify row for every job, and unique operators, is accepted")
+    raises(lambda: build_report(four, notify=all_rows),
+           "--notify without the operators is refused")
+    raises(lambda: build_report(four, operators=ops),
+           "--operators without the notify export is refused")
+    raises(lambda: build_report(four, notify=[], operators=ops),
+           "a header-only notify export is refused, not read as clean  "
+           "<-- pinned defect")
+    report = build_report(four, notify=all_rows, operators=[])
+    check(kinds(report.findings) == ["NO_FAILURE_ALERT"] * 4 +
+          ["MAIL_UNCHECKED"] and gate(report) == 1 and
+          report.checked == ["failure alerts"],
+          "a server with no operators flags every enabled job, and a "
+          "header-only operators export is legitimate")
+    report = build_report(four, notify=all_rows, operators=ops)
+    check(kinds(report.findings) == ["MAIL_UNCHECKED"] and gate(report) == 0
+          and "no --mail export was given" in report.findings[0].text,
+          "notify without --mail warns that mail was not checked, so a clean "
+          "run does not claim more than it read")
+    lines = describe(report)
+    check(lines[0] == "stepflow: 4 job(s), 0 step(s), 0 history row(s), 0 "
+          "activity row(s), 4 notify row(s), 6 operator(s)",
+          "the report opens with the notify and operator counts when they "
+          "were read")
+    report = build_report(four, notify=all_rows, operators=ops,
+                          mail=Mail("Windows", 0, ""))
+    check(kinds(report.findings) == ["MAIL_NEVER_SENDS"] and
+          report.checked == ["failure alerts", "agent mail"] and
+          gate(report) == 1,
+          "dead mail is one finding, not one per job: every job names an "
+          "operator, and the cause is filed once")
+    report = build_report(four, mail=Mail("Windows", 1, "Ops mail", 1, 1))
+    check(report.checked == ["agent mail"] and report.findings == [] and
+          report.alert_counts is None and gate(report) == 0,
+          "--mail alone checks the mail setting and nothing else")
+
     # ---- real files on disk, through main(). One temp directory, deleted
     # again at the end.
     tmp = tempfile.mkdtemp(prefix="stepflow-selftest-")
@@ -1833,6 +2262,239 @@ def self_test():
     check(code == 0 and out == SQL["jobs"],
           "main with no argv reads the arguments after the program name")
 
+    # ---- failure alerts, through main(). The first four fixtures are real
+    # exports of the --sql notify, operators, mail and jobs SELECTs, taken
+    # with sqlcmd -y 0 -f o:65001 from a SQL Server 2022 container on Linux.
+    real_jobs = (
+        "job_id,name,start_step_id,eol\n"
+        "10B3E075-6770-42E0-9E5E-16510554BC66,\"sf disabled operator\",1,$\n"
+        "07C397FE-AE28-41E7-907A-20B11AD943D4,\"sf failing\",1,$\n"
+        "84A78982-1742-4FBC-8145-4E9977F2DF4A,\"sf orphan operator\",1,$\n"
+        "255DF894-0012-4CD7-B944-52AFB317E2A6,\"sf netsend\",1,$\n"
+        "A53BBC66-BE80-4DA3-A4CC-6FAA8ED06DDC,\"sf no operator\",1,$\n"
+        "08476B3B-856B-4398-8455-72F1F4F837A1,\"sf healthy\",1,$\n"
+        "96D3AC5F-9317-4DF3-BE0F-7DD375644AA9,\"sf pager ok\",1,$\n"
+        "AC0C4D71-3C24-47CA-AB1A-A2A90C3B905B,\"sf success only\",1,$\n"
+        "FBF84BDF-9AB2-4C0F-AF55-B08877370A6B,\"sf disabled job\",1,$\n"
+        "A58527A0-9E00-4FAF-B37E-B1AB724E3B1F,\"sf blank address\",1,$\n"
+        "44A04323-B954-4430-897C-B2AF71AB8636,\"sf pager never\",1,$\n"
+        "FD3AA55C-01E5-46A2-B055-EEB81D191D58,\"sf level no operator\",1,$\n"
+    )
+    real_notify = (
+        "job_id,enabled,email_level,email_operator_id,page_level,page_operator_id,netsend_level,netsend_operator_id,eol\n"
+        "10B3E075-6770-42E0-9E5E-16510554BC66,1,3,2,0,0,0,0,$\n"
+        "07C397FE-AE28-41E7-907A-20B11AD943D4,1,2,1,0,0,0,0,$\n"
+        "84A78982-1742-4FBC-8145-4E9977F2DF4A,1,2,99,0,0,0,0,$\n"
+        "255DF894-0012-4CD7-B944-52AFB317E2A6,1,0,0,0,0,2,1,$\n"
+        "A53BBC66-BE80-4DA3-A4CC-6FAA8ED06DDC,1,0,0,0,0,0,0,$\n"
+        "08476B3B-856B-4398-8455-72F1F4F837A1,1,2,1,0,0,0,0,$\n"
+        "96D3AC5F-9317-4DF3-BE0F-7DD375644AA9,1,0,0,2,5,0,0,$\n"
+        "AC0C4D71-3C24-47CA-AB1A-A2A90C3B905B,1,1,1,0,0,0,0,$\n"
+        "FBF84BDF-9AB2-4C0F-AF55-B08877370A6B,0,0,0,0,0,0,0,$\n"
+        "A58527A0-9E00-4FAF-B37E-B1AB724E3B1F,1,2,3,0,0,0,0,$\n"
+        "44A04323-B954-4430-897C-B2AF71AB8636,1,0,0,2,4,0,0,$\n"
+        "FD3AA55C-01E5-46A2-B055-EEB81D191D58,1,0,0,0,0,0,0,$\n"
+    )
+    real_operators = (
+        "id,name,enabled,email_address,pager_address,pager_days,eol\n"
+        "3,\"sf blank \"\"quoted\"\", op\",1,\"\",\"\",0,$\n"
+        "2,\"sf off duty\",0,\"off@example.invalid\",\"\",0,$\n"
+        "1,\"sf ops\",1,\"ops@example.invalid\",\"\",0,$\n"
+        "4,\"sf pager never\",1,\"\",\"pg1@example.invalid\",0,$\n"
+        "5,\"sf pager ok\",1,\"\",\"pg2@example.invalid\",127,$\n"
+    )
+    real_mail = (
+        "platform,use_databasemail,databasemail_profile,profile_exists,"
+        "database_mail_xps,eol\n"
+        "Linux,1,\"\",0,0,$\n"
+    )
+    ra_jobs = tmpfile("ra_jobs.csv", real_jobs)
+    ra_notify = tmpfile("ra_notify.csv", real_notify)
+    ra_ops = tmpfile("ra_operators.csv", real_operators)
+    ra_mail = tmpfile("ra_mail.csv", real_mail)
+    code, out, err = run_cli(["--jobs", ra_jobs, "--notify", ra_notify,
+                              "--operators", ra_ops, "--mail", ra_mail])
+    check(code == 1 and err == "" and out.count("FAIL  NO_FAILURE_ALERT") == 8
+          and "stepflow: 12 job(s), 0 step(s), 0 history row(s), 0 activity "
+          "row(s), 12 notify row(s), 5 operator(s)" in out and
+          "checked: failure alerts, agent mail" in out,
+          "the real exports: eight jobs tell nobody, and the run exits 1")
+    for name, why in (
+            ("sf blank address", "which has no e-mail address"),
+            ("sf disabled operator", "'sf off duty', which is disabled"),
+            ("sf netsend", "not supported"),
+            ("sf no operator", "no notification channel is set"),
+            ("sf orphan operator", "operator id 99"),
+            ("sf pager never", "pager_days is 0"),
+            ("sf success only", "'on success only'")):
+        check(any(line.startswith("FAIL  NO_FAILURE_ALERT       %s: " % name)
+                  and why in line for line in out.splitlines()),
+              "the real export flags '%s': %s" % (name, why))
+    check('operator \'sf blank "quoted", op\'' in out,
+          "an operator name with a quote and a comma survives the CSV")
+    check("@" not in out and "example.invalid" not in out,
+          "the report prints no operator e-mail or pager address")
+    check(not any(("%s: " % name) in out for name in (
+        "sf healthy", "sf pager ok", "sf failing", "sf disabled job")),
+          "a working e-mail, a working pager, and a disabled job are clean")
+    check("WARN  MAIL_UNCHECKED         (SQL Server Agent): this export came "
+          "from SQL Server on Linux" in out and
+          "MAIL_NEVER_SENDS" not in out,
+          "the Linux mail export is MAIL_UNCHECKED, never a false "
+          "MAIL_NEVER_SENDS")
+    check("sf level no operator: no operator is told when this job fails: "
+          "no notification channel is set." in out,
+          "sp_update_job with a level and no operator stored level 0, and "
+          "the job reads as no channel set")
+
+    win_mail = real_mail.replace("Linux,1", "Windows,0")
+    legacy = tmpfile("ra_legacy.csv",
+                     win_mail.replace('"",0,0,$', '"Old Profile",0,0,$'))
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", legacy])
+    check(code == 1 and "FAIL  MAIL_NEVER_SENDS       (SQL Server Agent): "
+          "Agent mail is not enabled: use_databasemail is 0, and the profile "
+          "'Old Profile' is set." in out and "checked: agent mail" in out,
+          "a hand-written Windows mail row with a profile and use_databasemail "
+          "0 exits 1, and the finding names the profile  <-- pinned defect")
+    nullish = tmpfile("ra_null.csv", "platform,use_databasemail,"
+                      "databasemail_profile\nWindows,NULL,\n")
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", nullish])
+    check(code == 1 and "use_databasemail is 0" in out,
+          "a NULL use_databasemail reads as not enabled")
+    mail_head = real_mail.splitlines()[0] + "\n"
+    good = tmpfile("ra_good.csv", mail_head + 'Windows,1,"Ops mail",1,1,$\n')
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", good])
+    check(code == 0 and "VERDICT: no finding fails the gate, 0 warning(s)."
+          in out, "database mail with a profile that exists and the XPs on "
+          "exits 0")
+    typo = tmpfile("ra_typo.csv", mail_head + 'Windows,1,"no such",0,1,$\n')
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", typo])
+    check(code == 1 and "'no such' is not in msdb.dbo.sysmail_profile" in out,
+          "a mistyped profile name exits 1  <-- pinned defect")
+    xps_off = tmpfile("ra_xps.csv",
+                      mail_head + 'Windows,1,"Ops mail",1,0,$\n')
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", xps_off])
+    check(code == 1 and "'Database Mail XPs' option is 0" in out,
+          "database mail XPs off exits 1  <-- pinned defect")
+    old_shape = tmpfile("ra_old.csv", "platform,use_databasemail,"
+                        "databasemail_profile\nWindows,1,\"Ops mail\"\n")
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", old_shape])
+    check(code == 0 and "WARN  MAIL_UNCHECKED" in out and
+          "1 warning(s)" in out,
+          "a mail export without the two check columns warns, and does not "
+          "claim a clean result")
+    bad_flag = tmpfile("ra_flag.csv",
+                       mail_head + 'Windows,1,"Ops mail",2,1,$\n')
+    code, _, err = run_cli(["--jobs", ra_jobs, "--mail", bad_flag])
+    check(code == 2 and "profile_exists is 2, and only 0, 1 are defined"
+          in err, "a profile_exists of 2 exits 2")
+    blank_checks = tmpfile("ra_blank.csv",
+                           mail_head + 'Windows,1,"Ops mail",NULL,,$\n')
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", blank_checks])
+    check(code == 0 and "WARN  MAIL_UNCHECKED" in out,
+          "NULL or empty check columns read as unknown")
+    steps_row = ('11111111-1111-1111-1111-111111111111,1,"load",1,0,2,0,'
+                 '"sqlcmd -S srv -U sa -P Hunter2pass! -Q ""select 1""",$\n')
+    headerless = tmpfile("ra_nohdr.csv", steps_row)
+    code, out, err = run_cli(["--jobs", ra_jobs, "--steps", headerless])
+    check(code == 2 and "columns not in the export" in err and
+          "hunter2pass" not in err.lower() and "sqlcmd" not in err.lower()
+          and "<cell>" in err,
+          "a steps export with no header row does not echo its first "
+          "command to stderr  <-- pinned defect")
+    wide = tmpfile("ra_wide.csv", ",".join("c%d" % n for n in range(20)) +
+                   "\n")
+    code, out, err = run_cli(["--jobs", ra_jobs, "--steps", wide])
+    check(code == 2 and err.count("<cell>") == 12 and ", ..." in err,
+          "a header of many cells names twelve and then stops")
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--notify", ra_notify,
+                            "--operators", ra_ops, "--mail", good])
+    check(code == 1 and "checked: failure alerts, agent mail" in out and
+          "MAIL_UNCHECKED" not in out and out.count("NO_FAILURE_ALERT") == 8,
+          "with a good mail row the per-job findings stand alone")
+
+    def alert_error(label, expect, notify_text=None, ops_text=None,
+                    mail_text=None, code_wanted=2):
+        argv = ["--jobs", ra_jobs]
+        for flag, text in (("--notify", notify_text),
+                           ("--operators", ops_text), ("--mail", mail_text)):
+            if text is not None:
+                argv += [flag, tmpfile("ae%s.csv" % flag[2:], text)]
+        code, _, err = run_cli(argv)
+        check(code == code_wanted and expect in err, label)
+
+    head_n = real_notify.splitlines()[0]
+    first_n = real_notify.splitlines()[1]
+    alert_error("a notify level of 4 exits 2 and names the column",
+                "email_level is 4, and only 0, 1, 2, 3 are defined",
+                head_n + "\n" + first_n.replace(",1,3,2,", ",1,4,2,") + "\n",
+                real_operators)
+    alert_error("a negative operator id exits 2",
+                "email_operator_id is -1, and an id is not negative",
+                head_n + "\n" + first_n.replace(",3,2,", ",3,-1,") + "\n",
+                real_operators)
+    alert_error("an enabled flag of 2 exits 2",
+                "enabled is 2, and only 0, 1 are defined",
+                head_n + "\n" + first_n.replace(",1,3,", ",2,3,") + "\n",
+                real_operators)
+    alert_error("a job missing from the notify export exits 2 and names it",
+                "the notify export has no row for job id",
+                head_n + "\n" + first_n + "\n", real_operators)
+    alert_error("a header-only notify export exits 2, not a clean pass",
+                "the notify export has no rows", head_n + "\n",
+                real_operators)
+    alert_error("a pager_days of 128 exits 2",
+                "pager_days is 128, and only 0, 1,",
+                real_notify, real_operators.replace(",0,$", ",128,$", 1))
+    alert_error("an operators export without a column exits 2 and names it",
+                "columns not in the export: pager_days", real_notify,
+                real_operators.replace("pager_days,", ""))
+    alert_error("a mail export with two rows exits 2",
+                "has 2 rows", None, None,
+                real_mail + real_mail.splitlines()[1] + "\n")
+    alert_error("a header-only mail export exits 2",
+                "has 0 rows", None, None, real_mail.splitlines()[0] + "\n")
+    alert_error("use_databasemail of 2 exits 2",
+                "use_databasemail is 2, and only 0, 1 are defined", None,
+                None, real_mail.replace("Linux,1", "Windows,2"))
+    alert_error("--notify without --operators is a usage error",
+                "--notify and --operators go together", real_notify,
+                None, None, 64)
+    alert_error("--operators without --notify is a usage error",
+                "--notify and --operators go together", None,
+                real_operators, None, 64)
+    code, _, err = run_cli(["--jobs", ra_jobs, "--notif", ra_notify,
+                            "--operators", ra_ops])
+    check(code == 64, "a prefix --notif of --notify is refused  "
+          "<-- pinned defect")
+    code, _, err = run_cli(["--jobs", ra_jobs, "--mail", good, "--report",
+                            good, "--apply"])
+    check(code == 64 and "--report names an input export" in err,
+          "--report cannot name the --mail export")
+    code, _, err = run_cli(["--jobs", ra_jobs, "--notify", ra_notify,
+                            "--operators", ra_ops, "--report", ra_ops,
+                            "--apply"])
+    check(code == 64 and "--report names an input export" in err,
+          "--report cannot name the --operators export")
+    before = set(os.listdir(tmp))
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--notify", ra_notify,
+                            "--operators", ra_ops, "--mail", ra_mail,
+                            "--report", os.path.join(tmp, "alerts.txt")])
+    check(code == 1 and set(os.listdir(tmp)) == before and
+          "nothing was written" in out,
+          "the alert checks write nothing without --apply")
+    for name in ("notify", "operators", "mail"):
+        code, out, _ = run_cli(["--sql", name])
+        check(code == 0 and out == SQL[name] and "$')" in out and
+              "SET NOCOUNT ON;" in out,
+              "--sql %s prints its SELECT, with the eol column and "
+              "NOCOUNT" % name)
+    check("password" not in "".join(SQL.values()).lower() and
+          "host_login" not in "".join(SQL.values()).lower(),
+          "no SELECT reads a password column: sp_get_sqlagent_properties "
+          "returns one, and the mail SELECT reads two registry values "
+          "instead")
+
     # ---- the harness itself
     mark = len(failed)
     quiet = sys.stdout
@@ -1912,9 +2574,15 @@ def read_table(path, required):
         # sqlcmd prints the column name "line" and a row of dashes over the
         # --sql output unless -y 0 is given, and -y 0 also stops the cut.
         hint = " Run sqlcmd with -y 0." if header == ["line"] else ""
+        # A file with no header row puts its first data row here, and a steps
+        # row holds a command. Name only cells that look like column names.
+        names = [h if re.match(r"^[a-z_ ]{1,32}$", h) else "<cell>"
+                 for h in header[:12]]
+        if len(header) > 12:
+            names.append("...")
         raise ValueError("%s: columns not in the export: %s. It has: %s.%s"
                          % (path, ", ".join(absent),
-                            ", ".join(header) or "(no columns at all)",
+                            ", ".join(names) or "(no columns at all)",
                             hint))
     rows = []
     end = reader.line_num
@@ -2021,6 +2689,65 @@ def load_activity(path):
             for r in read_table(path, COLUMNS["activity"])]
 
 
+def _cell_choice(row, column, path, allowed):
+    value = _cell_int(row, column, path)
+    if value not in allowed:
+        raise ValueError("%s line %d: %s is %d, and only %s are defined"
+                         % (path, row["_line"], column, value,
+                            ", ".join(str(a) for a in allowed)))
+    return value
+
+
+def _cell_id(row, column, path):
+    value = _cell_int(row, column, path)
+    if value < 0:
+        raise ValueError("%s line %d: %s is %d, and an id is not negative"
+                         % (path, row["_line"], column, value))
+    return value
+
+
+def load_notify(path):
+    rows = []
+    for r in read_table(path, COLUMNS["notify"]):
+        channels = [(_cell_choice(r, "%s_level" % c, path, (0, 1, 2, 3)),
+                     _cell_id(r, "%s_operator_id" % c, path))
+                    for c in ("email", "page", "netsend")]
+        rows.append(Notify(_cell_job(r, path),
+                           _cell_choice(r, "enabled", path, (0, 1)),
+                           *channels))
+    return rows
+
+
+def load_operators(path):
+    return [Operator(_cell_id(r, "id", path), r["name"],
+                     _cell_choice(r, "enabled", path, (0, 1)),
+                     r["email_address"], r["pager_address"],
+                     _cell_choice(r, "pager_days", path, range(128)))
+            for r in read_table(path, COLUMNS["operators"])]
+
+
+def load_mail(path):
+    rows = read_table(path, COLUMNS["mail"])
+    if len(rows) != 1:
+        raise ValueError("%s has %d rows. The Agent mail export has exactly "
+                         "one. Check that the query ran on the right "
+                         "server." % (path, len(rows)))
+    r = rows[0]
+    # A value the registry does not hold reads as NULL or empty: not enabled.
+    if r["use_databasemail"].strip() in ("", "NULL"):
+        r["use_databasemail"] = "0"
+    checks = []
+    for column in ("profile_exists", "database_mail_xps"):
+        # A column the export lacks, or leaves empty, is not known.
+        if r.get(column, "").strip() in ("", "NULL"):
+            checks.append(None)
+        else:
+            checks.append(_cell_choice(r, column, path, (0, 1)))
+    return Mail(r["platform"], _cell_choice(r, "use_databasemail", path,
+                                            (0, 1)),
+                r["databasemail_profile"], *checks)
+
+
 class _Parser(argparse.ArgumentParser):
     """An argparse parser whose usage errors exit 64, not 2.
 
@@ -2037,8 +2764,9 @@ def _parse(argv):
     ap = _Parser(
         prog="stepflow.py",
         description="Flag SQL Server Agent job steps that never run, "
-                    "watchdogs bound to a job name, and runs far past their "
-                    "normal duration, from exported msdb rows.",
+                    "watchdogs bound to a job name, runs far past their "
+                    "normal duration, and jobs that tell nobody when they "
+                    "fail, from exported msdb rows.",
         epilog="Nothing is written without --apply.",
         allow_abbrev=False,
     )
@@ -2048,6 +2776,14 @@ def _parse(argv):
                     help="the sysjobhistory export (--sql history)")
     ap.add_argument("--activity",
                     help="the sysjobactivity export (--sql activity)")
+    ap.add_argument("--notify",
+                    help="the sysjobs notification export (--sql notify). "
+                         "Needs --operators.")
+    ap.add_argument("--operators",
+                    help="the sysoperators export (--sql operators). Needs "
+                         "--notify.")
+    ap.add_argument("--mail",
+                    help="the Agent mail setting export (--sql mail)")
     ap.add_argument("--factor", type=float, default=DEFAULT_FACTOR,
                     help="a run past this many times the median of the "
                          "job's other successful runs is flagged "
@@ -2113,12 +2849,17 @@ def main(argv=None):
         return 0
     # "is None", not truthiness: --steps "" (an unset shell variable) is a
     # path that cannot be opened, and exits 2, not a check that is skipped.
-    paths = (args.jobs, args.steps, args.history, args.activity)
+    paths = (args.jobs, args.steps, args.history, args.activity, args.notify,
+             args.operators, args.mail)
     if args.jobs is None:
         return _usage("--jobs is required. Print its SELECT with --sql jobs.")
-    if paths[1:] == (None, None, None):
-        return _usage("give --steps, --history or --activity as well. "
-                      "--jobs alone checks nothing.")
+    if paths[1:] == (None,) * 6:
+        return _usage("give --steps, --history or --activity as well, or "
+                      "--notify with --operators, or --mail. --jobs alone "
+                      "checks nothing.")
+    if (args.notify is None) != (args.operators is None):
+        return _usage("--notify and --operators go together: an operator id "
+                      "means nothing without the operators.")
     # Written as a range test so that nan, which fails every comparison, is
     # refused too. inf would turn the timing checks off.
     if not 1 < args.factor < float("inf"):
@@ -2150,8 +2891,13 @@ def main(argv=None):
         history = None if args.history is None else load_history(args.history)
         activity = None if args.activity is None else \
             load_activity(args.activity)
+        notify = None if args.notify is None else load_notify(args.notify)
+        operators = None if args.operators is None else \
+            load_operators(args.operators)
+        mail = None if args.mail is None else load_mail(args.mail)
         report = build_report(jobs, steps, history, activity, args.factor,
-                              args.min_runs, args.min_seconds, before)
+                              args.min_runs, args.min_seconds, before,
+                              notify, operators, mail)
     except (ValueError, OSError, csv.Error) as exc:
         # csv.Error too: a field over csv's limit, or a NUL in the file, is
         # an export that could not be read, not a finding.

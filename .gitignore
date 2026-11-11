@@ -19,3 +19,6 @@ history.csv
 activity.csv
 stepflow.txt
 .coverage
+notify.csv
+operators.csv
+mail.csv
