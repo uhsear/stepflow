@@ -504,7 +504,6 @@ _ID_ARG = re.compile(r"@job_id\s*=\s*N?\x01(\d+)\x01", re.I)
 _GUID_LIT = re.compile(r"\A\{?([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\}?\Z",
                        re.I)
 _SYSJOBS = re.compile(r"\[?\bsysjobs(?:_view)?\b\]?(?:\s+(?:as\s+)?(\w+))?", re.I)
-_SOURCE = re.compile(r"\b(?:from|join)\s+(?:\[?\w+\]?\s*\.\s*)*\[?(\w+)", re.I)
 _PROC = re.compile(r"\bsp_\w+", re.I)
 _NOT_EXISTS = re.compile(r"\bnot\s+exists\s*\(", re.I)
 _NOT_ALIAS = frozenset(("where", "join", "inner", "left", "right", "full",
@@ -564,8 +563,8 @@ def job_references(text):
     kind is "name", "like" or "id". A name compared in a WHERE clause counts
     only when the command reads msdb's sysjobs and the column is sysjobs's
     own, because "name" is the most common column name there is: j.name counts
-    when j is an alias of sysjobs, and a bare name counts when sysjobs is the
-    only table read. A value holding an Agent token such as
+    when j is an alias of sysjobs, and a bare name counts when sysjobs is one
+    of the tables read, because T-SQL refuses an ambiguous bare column. A value holding an Agent token such as
     $(ESCAPE_SQUOTE(JOBNAME)) is resolved at run time, so it is skipped. So is
     the name that sp_add_job gives a new job, and a name looked up inside a
     NOT EXISTS: both expect the job to be absent.
@@ -594,12 +593,10 @@ def job_references(text):
             alias = (table.group(1) or "").lower()
             if alias and alias not in _NOT_ALIAS:
                 names.add(alias)
-        alone = all(m.group(1).lower() in ("sysjobs", "sysjobs_view")
-                    for m in _SOURCE.finditer(code))
         for match in _NAME_FILTER.finditer(code):
             prefix = match.group(1).replace("[", "").replace("]", "")
             qualifier = prefix.rstrip(". ").split(".")[-1].strip().lower()
-            if (qualifier in names if qualifier else alone) and \
+            if (qualifier in names if qualifier else True) and \
                     not _inside_not_exists(code, match.start()):
                 add("like" if match.group(2).lower() == "like" else "name",
                     literals[int(match.group(3))])
@@ -1336,8 +1333,15 @@ def self_test():
           "<-- pinned defect")
     check(job_references(
         "SELECT 1 FROM msdb.dbo.sysjobs JOIN msdb.dbo.sysjobschedules ON "
-        "1 = 1 WHERE name = N'x'") == [],
-          "a bare name is read only when sysjobs is the only table")
+        "1 = 1 WHERE name = N'x'") == [("name", "x")],
+          "a bare name is read when sysjobs is one of the tables  "
+          "<-- pinned defect")
+    check(job_references(
+        "IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs j JOIN "
+        "msdb.dbo.sysjobactivity a ON a.job_id = j.job_id WHERE name = "
+        "N'Gone Job') PRINT 'running';") == [("name", "Gone Job")],
+          "a watchdog that joins sysjobactivity still names its job  "
+          "<-- pinned defect")
     check(job_references("SELECT 1 FROM msdb.dbo.sysjobs; SET @name = N'x'")
           == [], "a variable called @name is not the column")
     check(job_references(

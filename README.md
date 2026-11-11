@@ -99,10 +99,10 @@ PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the footer counts a failure and exits 1 on it
 PASS  the file imports as a module without running main
 --------------------------------------------------------------------
-331 assertions, 0 failed
+332 assertions, 0 failed
 ```
 
-The full run prints all 331 assertions. Each `...` line marks a cut in this block.
+The full run prints all 332 assertions. Each `...` line marks a cut in this block.
 
 ## What already exists
 
@@ -146,8 +146,8 @@ Server Agent.
 Python 3.9 or newer and nothing else. No database driver, no third-party package, no network.
 You run the SELECTs yourself with `sqlcmd` and give stepflow the CSV files.
 
-The same 331 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
-(Python 3.9.25). The three runs print the same text. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1453
+The same 332 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
+(Python 3.9.25). The three runs print the same text. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1452
 statements, 362 branches). The code compiles with `python -W error` and passes `pyflakes`.
 
 ```
@@ -443,8 +443,8 @@ stepflow reads these forms in every step command, of every subsystem:
 - `@job_name = N'...'`, as `sp_start_job`, `sp_stop_job` and the other job procedures take it.
 - `sp_start_job N'...'` and `sp_stop_job N'...'`, with the name as the first positional value.
 - `name = N'...'` and `name LIKE N'...'`, only when the column is the one of `sysjobs` or
-  `sysjobs_view`: `j.name` where `j` is an alias of that table, or a bare `name` when it is the
-  only table the command reads. `c.name` on `syscategories` is not read.
+  `sysjobs_view`: `j.name` where `j` is an alias of that table, or a bare `name` when `sysjobs`
+  is one of the tables the command reads, joins included. `c.name` on `syscategories` is not read.
 - `@job_id = '...'`, a literal job id.
 
 A name resolves the way T-SQL `=` compares on a case-insensitive collation: trailing spaces and
@@ -631,8 +631,10 @@ Exports and output
   reference scan take seconds (1,300 lookups in a 99,000 character command took 5 seconds). A
   `LIKE` pattern with more than a handful of `%` wildcards can make the match against a job name
   very slow (8 wildcards against a 40 character name took 3.7 seconds).
-- A bare `name = 'x'` in a command that also reads `sysjobs` can belong to another table, such
-  as `UPDATE dbo.cfg SET name = 'x'`. It can give a false `DISARMED`, and it prints that literal.
+- A bare `name = 'x'` in a command that also reads `sysjobs` is taken as the job name, even
+  when it belongs to another table, such as `UPDATE dbo.cfg SET name = 'x'`. It can give a
+  false `DISARMED`, and it prints that literal. Two joined tables that both have a `name`
+  column make T-SQL refuse a bare `name`, so a working step does not hit that case.
 - Do not open the exports in a spreadsheet. A job or step name that starts with `=`, `+`, `-`
   or `@` is written by `sqlcmd` without a guard, so a spreadsheet can run it as a formula.
 - `--report` with `--apply` truncates the report file before it writes it, so a write that fails
@@ -693,6 +695,26 @@ Failure alerts
 - A Linux server is `MAIL_UNCHECKED`, a warning that exits 3. The run cannot tell a working
   Linux Agent from a broken one.
 - `notify_level_eventlog` (the Windows event log) is not read, because a log line tells no one.
+- Alert checks run only when `--notify` with `--operators`, or `--mail`, is given. A command line
+  with only `--jobs` and `--steps` never checks alerts, and exits 0 when the flow checks pass.
+- The legacy `@email_profile` finding text was checked on SQL Server 2022 only.
+- The mail SELECT turns a registry value it could not read into `use_databasemail` 0. If the
+  registry error does not reach the output file, `MAIL_NEVER_SENDS` can be a false positive.
+- An operator `email_address` that holds only spaces counts as an address, so a job that notifies
+  that operator is not flagged `NO_FAILURE_ALERT`.
+- The report is plain text and prints names as they are. Do not paste it into a spreadsheet.
+- Do not open the exports in a spreadsheet, including cells that start with a tab or a carriage
+  return.
+- A job id that differs only in letter case between two exports is read as a different job, and
+  the run exits 2.
+- An empty steps export, with a header and no rows, is read as "no job has steps" and fails every
+  job with `START_MISSING`. Check that the steps query ran against the right server.
+- A single apostrophe outside a T-SQL string, for example in a CmdExec or PowerShell step, shifts
+  how quotes pair, and a job name later in that command can be missed.
+- A NUL byte inside an export is accepted on Python 3.11 and newer and refused with exit 2 on
+  Python 3.9 and 3.10.
+- Five self-test labels start with a capital letter, against the lowercase-label house rule. It is
+  a style point only.
 
 Scope
 - It does not read schedules, Agent alerts, or multiserver (master and target) jobs. It reads the
