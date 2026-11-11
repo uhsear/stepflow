@@ -889,8 +889,8 @@ def analyse_mail(mail):
             "Agent mail is not enabled: use_databasemail is %d%s. Agent sends "
             "no job or alert notification. A profile set with the "
             "@email_profile parameter of sp_set_sqlagent_properties is "
-            "stored nowhere: that parameter is obsolete, and SQL Mail was "
-            "discontinued in SQL Server 2012. Set @use_databasemail = 1 and "
+            "stored nowhere on SQL Server 2012 and newer: that parameter is "
+            "obsolete, and SQL Mail was discontinued in SQL Server 2012. Set @use_databasemail = 1 and "
             "@databasemail_profile, then restart Agent."
             % (mail.use_databasemail,
                ", and the profile '%s' is set" % mail.databasemail_profile
@@ -2044,9 +2044,10 @@ def self_test():
           "a missing column exits 2 and lists the columns there are")
     bad = tmpfile("line.csv", "line\n-----\njob_id,name,start_step_id,eol\n")
     code, _, err = run_cli(["--jobs", bad, "--steps", steps_csv])
-    check(code == 2 and "It has: line. Run sqlcmd with -y 0." in err,
-          "the header sqlcmd prints without -y 0 exits 2 and names -y 0  "
-          "<-- pinned defect")
+    check(code == 2 and "It has: line. Run sqlcmd with -h -1." in err and
+          "-y 0" not in err,
+          "the heading sqlcmd prints without -h -1 exits 2 and names -h -1, "
+          "not -y 0  <-- pinned defect")
     empty = tmpfile("empty.csv", "")
     code, _, err = run_cli(["--jobs", empty, "--steps", steps_csv])
     check(code == 2 and "(no columns at all)" in err,
@@ -2693,8 +2694,9 @@ def read_table(path, required):
     absent = [c for c in required if c not in header]
     if absent:
         # sqlcmd prints the column name "line" and a row of dashes over the
-        # --sql output unless -y 0 is given, and -y 0 also stops the cut.
-        hint = " Run sqlcmd with -y 0." if header == ["line"] else ""
+        # --sql output unless -h -1 is given. -y 0 is the separate flag that
+        # stops the 256 character cut.
+        hint = " Run sqlcmd with -h -1." if header == ["line"] else ""
         # A file with no header row puts its first data row here, and a steps
         # row holds a command. Name only cells that are a known column name.
         names = [h if h in _KNOWN_HEADERS else "<cell>"

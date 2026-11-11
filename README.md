@@ -36,39 +36,17 @@ PASS  and the finding names the step before it and its success action
 ...
 PASS  go to the next step on the last step is DANGLING: Agent fails the job there  <-- pinned defect
 ...
-PASS  a job nobody hears a failure of is NO_FAILURE_ALERT, and it fails the gate  <-- pinned defect
-...
-PASS  Agent mail that was never enabled never sends, and the finding names the obsolete @email_profile parameter  <-- pinned defect
-...
-PASS  a Linux export is MAIL_UNCHECKED, not a false MAIL_NEVER_SENDS: the registry does not hold the Linux profile  <-- pinned defect
-...
-PASS  a job with no row in the notify export is refused, not judged on settings that were never read  <-- pinned defect
-PASS  a header-only notify export is refused, not read as clean  <-- pinned defect
-...
-PASS  dead mail is one finding, not one per job: every job names an operator, and the cause is filed once
-...
-PASS  a hand-written Windows mail row with a profile and use_databasemail 0 exits 1, and the finding names the profile  <-- pinned defect
-PASS  a mistyped profile name exits 1  <-- pinned defect
-PASS  database mail XPs off exits 1  <-- pinned defect
-...
-PASS  a Linux mail export exits 3, not 0: the setting was not read  <-- pinned defect
-PASS  a run of a job with too few runs to time exits 3, not 0  <-- pinned defect
-...
-PASS  a steps export with no header row does not echo its first command to stderr  <-- pinned defect
-PASS  a command in an integer cell is not copied into the error  <-- pinned defect
-PASS  an e-mail address in the id cell is not copied into the error  <-- pinned defect
-...
-PASS  the real exports: eight jobs tell nobody, and the run exits 1
-...
 PASS  a start step that was deleted is START_MISSING  <-- pinned defect
 ...
 PASS  a step whose failure quits reporting success is FAIL_REPORTS_SUCCESS  <-- pinned defect
 ...
-PASS  a watchdog whose target was renamed is DISARMED, once  <-- pinned defect
-...
 PASS  a name in a -- comment is not a binding  <-- pinned defect
+...
 PASS  a call inside dynamic SQL is not seen, and no empty name is read  <-- pinned defect
+...
 PASS  a name compared on another table is not a job name  <-- pinned defect
+...
+PASS  a watchdog whose target was renamed is DISARMED, once  <-- pinned defect
 ...
 PASS  a 5 hour run against a 102.5 second median is FAR_PAST_NORMAL  <-- pinned defect
 PASS  and it says the run reads as Succeeded, with its ratio
@@ -79,15 +57,43 @@ PASS  --baseline-before takes the median from before the spiral, and all six lon
 ...
 PASS  a run that reads as Succeeded with a failed step in it is GREEN_OVER_FAILED_STEP  <-- pinned defect
 ...
+PASS  a job nobody hears a failure of is NO_FAILURE_ALERT, and it fails the gate  <-- pinned defect
+...
+PASS  Agent mail that was never enabled never sends, and the finding names the obsolete @email_profile parameter  <-- pinned defect
+...
+PASS  a Linux export is MAIL_UNCHECKED, not a false MAIL_NEVER_SENDS: the registry does not hold the Linux profile  <-- pinned defect
+...
+PASS  a job with no row in the notify export is refused, not judged on settings that were never read  <-- pinned defect
+...
+PASS  a header-only notify export is refused, not read as clean  <-- pinned defect
+...
+PASS  dead mail is one finding, not one per job: every job names an operator, and the cause is filed once
+...
 PASS  a UTF-16 export, which sqlcmd -u and a PowerShell 5.1 redirect write, reads the same as UTF-8  <-- pinned defect
 ...
 PASS  a command cut at sqlcmd's 256 character default exits 2 and names -y 0  <-- pinned defect
 PASS  and it names the line the cut row starts on, not where the reader stopped  <-- pinned defect
 ...
+PASS  a jobs export with a header and no rows exits 2, not a clean pass  <-- pinned defect
+...
+PASS  an empty --steps, an unset shell variable, exits 2 and is not skipped  <-- pinned defect
+...
 PASS  a prefix --ap of --apply is refused, and nothing is written  <-- pinned defect
 ...
-PASS  a jobs export with a header and no rows exits 2, not a clean pass  <-- pinned defect
-PASS  an empty --steps, an unset shell variable, exits 2 and is not skipped  <-- pinned defect
+PASS  the real exports: eight jobs tell nobody, and the run exits 1
+...
+PASS  a hand-written Windows mail row with a profile and use_databasemail 0 exits 1, and the finding names the profile  <-- pinned defect
+...
+PASS  a mistyped profile name exits 1  <-- pinned defect
+PASS  database mail XPs off exits 1  <-- pinned defect
+...
+PASS  a Linux mail export exits 3, not 0: the setting was not read  <-- pinned defect
+PASS  a run of a job with too few runs to time exits 3, not 0  <-- pinned defect
+...
+PASS  a steps export with no header row does not echo its first command to stderr  <-- pinned defect
+PASS  a command in an integer cell is not copied into the error  <-- pinned defect
+...
+PASS  an e-mail address in the id cell is not copied into the error  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the footer counts a failure and exits 1 on it
@@ -141,8 +147,7 @@ Python 3.9 or newer and nothing else. No database driver, no third-party package
 You run the SELECTs yourself with `sqlcmd` and give stepflow the CSV files.
 
 The same 331 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
-(Python 3.9.25). The three runs print the same text, except that Windows ends each line with
-CR LF. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1453
+(Python 3.9.25). The three runs print the same text. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1453
 statements, 362 branches). The code compiles with `python -W error` and passes `pyflakes`.
 
 ```
@@ -152,7 +157,7 @@ git clone https://github.com/uhsear/stepflow.git
 ## Usage
 
 1. Print each SELECT into a file.
-2. Run each file with `sqlcmd` against `msdb`, with `-y 0`. Add your own connection options.
+2. Run each file with `sqlcmd` against `msdb`, with `-h -1` and `-y 0`. Add your own connection options.
 3. Give stepflow the CSV files.
 
 **The steps export is as sensitive as `msdb`.** It holds the full text of every job step
@@ -178,7 +183,7 @@ python stepflow.py --sql notify > notify.sql
 python stepflow.py --sql operators > operators.sql
 python stepflow.py --sql mail > mail.sql
 
-sqlcmd -S <server> -d msdb -y 0 -f o:65001 -i steps.sql -o steps.csv
+sqlcmd -S <server> -d msdb -h -1 -y 0 -f o:65001 -i steps.sql -o steps.csv
 
 python stepflow.py --jobs jobs.csv --steps steps.csv
 python stepflow.py --jobs jobs.csv --history history.csv --activity activity.csv
@@ -200,7 +205,7 @@ python stepflow.py --jobs jobs.csv --notify notify.csv --operators operators.csv
 | `--min-runs` | `5` | The fewest other successful runs a median is taken from. |
 | `--min-seconds` | `300` | A run shorter than this is never flagged, whatever its ratio. Must be 0 or more and finite. |
 | `--baseline-before` | off | Take the median only from runs that started before this date, `YYYY-MM-DD`. |
-| `--report` | off | Write the report to this file. Needs `--apply`. It cannot name an input export. |
+| `--report` | off | The file the report goes to. Nothing is written until `--apply` is also given. It cannot name an input export. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
 | `--sql` | off | Print the SELECT for `jobs`, `steps`, `history`, `activity`, `notify`, `operators` or `mail`, and exit. |
 | `--self-test` | off | Run the assertions and exit. It writes fixtures to a temporary directory and removes it. |
@@ -210,20 +215,25 @@ Give `--jobs` and at least one other export (`--notify` and `--operators` count 
 is not in the jobs export exits 2. A notify export must have a row for every job in the jobs
 export, so a job created or deleted between the two exports exits 2.
 
-### The SQL, and why `-y 0`
+### The SQL, and why `-h -1` and `-y 0`
 
 Each SELECT builds its CSV line in T-SQL: it quotes every name and command and doubles every
 quote inside them. A job step command holds commas, quotes and line breaks, so a client that
 splits on a separator cannot produce a correct CSV. Each line ends in an `eol` column that is
 always `$`.
 
-`sqlcmd` cuts every `nvarchar(max)` value at 256 characters unless you give `-y 0`. The cut
-loses the closing quote and the `eol` column, and stepflow exits 2 with the line where the cut
-row starts. Without `-y 0`, `sqlcmd` also prints a header named `line` and a row of dashes.
-stepflow names `-y 0` in both cases.
+Two `sqlcmd` flags matter, and they do different jobs. Microsoft documents `-h` as the
+number of rows between column headings: the default prints the headings once for each set of
+results, and `-1` prints none. Without `-h -1`, `sqlcmd` writes the column name `line` and a
+row of dashes above the data, and stepflow exits 2 and names `-h -1`. Microsoft documents `-y`
+as the limit on large variable length types: the default is 256, and `0` removes the limit.
+Without `-y 0`, `sqlcmd` cuts every `nvarchar(max)` value at 256 characters. The cut loses
+the closing quote and the `eol` column, and stepflow exits 2 with the line where the cut row
+starts and names `-y 0`. `-y` does not touch the headings.
 
 | Client behaviour | What stepflow does |
 |---|---|
+| `-h -1` missing | Exits 2 on the `line` heading, and the message names `-h -1`. |
 | `-y 0` missing | Exits 2, and the message names `-y 0`. |
 | `SET NOCOUNT ON` removed from the query | Exits 2 on the `(N rows affected)` line, and names `SET NOCOUNT ON`. |
 | `-u` (UTF-16 output) | Reads the file the same as UTF-8. |
@@ -568,6 +578,27 @@ Durations
 - Times are the server's own clock throughout. stepflow does no time zone conversion.
 
 Exports and output
+- The `-h -1` behaviour comes from the Microsoft `sqlcmd` page. The container exports above
+  were taken with `-y 0 -f o:65001`, and the `-h -1` command line was not run against a real
+  `sqlcmd`, because there is none on the machine that built this tool.
+- The SELECTs use `CONCAT`, so they need SQL Server 2012 or newer. They were run on SQL Server
+  2022 only.
+- The comment and string cutter handles single-quoted literals, `--` comments and `/* */`
+  comments. A double-quoted identifier or string that holds a quote or `--` can confuse it.
+- A `LIKE` pattern from a step command is printed in the exit 2 message, cut to 32 characters,
+  when the pattern is not valid.
+- A `LIKE` character class that holds a repeated range dash can make Python print a
+  `FutureWarning`. It does not change the verdict, but it stops the run if warnings are errors.
+- The tool reads the next step as `step_id + 1`, so a gap in step ids is reported as
+  `DANGLING`. Microsoft says step ids start at 1 and increment without gaps, and Agent
+  behaviour for a gap was not run.
+- An activity export with no rows exits 2 ("no running job could be seen"). On an idle or
+  freshly restarted Agent that can be a false refusal. Whether `sysjobactivity` holds a row
+  for an idle job was not checked.
+- A step command over 131072 characters exits 2 with a message that does not name the file or
+  line. One history row that is not a real date and time stops the run with exit 2, and that
+  message names the line.
+- A self-test that is killed half way leaves its temporary directory of fake fixtures behind.
 - The whole export is read into memory, so a very large steps export uses memory in proportion
   to its size. A step command over 131072 characters (the `csv` module's field limit) cannot
   be read and exits 2 with "field larger than field limit".
@@ -620,7 +651,8 @@ Failure alerts
   Server.
 - The hand-written row for a Linux server (see the mail check above) is not pinned by the
   self-test.
-- The statement that `@email_profile` stores nothing rests on SQL Server 2022 CU27 only. Older
+- The finding says a profile set with `@email_profile` is stored nowhere "on SQL Server 2012
+  and newer". That statement rests on SQL Server 2022 CU27 only. Older
   builds were not read, and Microsoft Learn has no page for `sp_set_sqlagent_properties` (the
   `sp-set-sqlagent-properties-transact-sql` address returned HTTP 404 on 2026-11-10), so the claim rests on
   the procedure text.
@@ -717,7 +749,8 @@ Scope
   `sqlagent.databasemailprofile`.
 - [Notify an Operator of Job Status](https://learn.microsoft.com/en-us/ssms/agent/notify-an-operator-of-job-status):
   the e-mail, pager and net send channels, and the "when the job fails" level.
-- [sqlcmd utility](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility): the `-y`
+- [sqlcmd utility](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility): `-h`
+  prints the headings once for each set of results and `-1` prints none, the `-y`
   default of 256, `-W` that "can't be used with the `-y` or `-Y` options", `-f` and `-u`.
 - [Resize the Job History Log](https://learn.microsoft.com/en-us/ssms/agent/resize-the-job-history-log):
   the History page settings that trim `sysjobhistory` by row count or by age.
