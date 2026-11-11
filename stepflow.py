@@ -33,8 +33,10 @@ failure.
 Nothing is written without --apply, except that --self-test writes fixtures
 to a temporary directory and removes it. Nothing connects to a server.
 
-Exit codes: 0 no finding fails the gate, 1 at least one does, 2 an export
-could not be read or is malformed, 64 usage error.
+Exit codes: 0 no finding fails the gate and every check ran, 1 at least one
+finding fails the gate, 2 an export could not be read or is malformed, 3 no
+finding fails but a check could not be made (NO_BASELINE, MAIL_UNCHECKED),
+64 usage error.
 """
 
 from __future__ import print_function
@@ -84,6 +86,9 @@ GATE = ("START_MISSING", "UNREACHABLE", "DANGLING", "FAIL_REPORTS_SUCCESS",
         "RUNNING_PAST_NORMAL", "NO_FAILURE_ALERT", "MAIL_NEVER_SENDS")
 WARN = ("FAIL_CAN_END_GREEN", "NAME_BOUND", "NO_BASELINE", "MAIL_UNCHECKED")
 KINDS = GATE + WARN
+# Warnings for a check the run could not make. A clean run that holds one
+# exits 3, not 0, so a pipeline cannot read "could not tell" as "all clear".
+UNTOLD = ("NO_BASELINE", "MAIL_UNCHECKED")
 
 # notify_level_* values (dbo.sysjobs): a bitmask, 1 on success and 2 on failure.
 LEVEL_WORDS = {0: "never", 1: "on success only", 2: "on failure",
@@ -306,6 +311,10 @@ class Report(object):
     def warnings(self):
         return [f for f in self.findings if not f.gate]
 
+    @property
+    def untold(self):
+        return [f for f in self.findings if f.kind in UNTOLD]
+
 
 # ------------------------------------------------------------- the decisions
 
@@ -317,6 +326,21 @@ def clip(value, width=32):
     """
     text = repr(value)
     return text if len(text) <= width else text[:width - 4] + "...'"
+
+
+_PLAIN_CELL = re.compile(r"\A[0-9 .:+-]{0,24}\Z")
+
+
+def show_cell(value):
+    """What an error may say about an export cell it rejected.
+
+    A misaligned export puts a command, a password or an e-mail address into
+    the cell an error names, so the text is shown only when it holds nothing
+    but digits and the signs of a number or a time.
+    """
+    if _PLAIN_CELL.match(value):
+        return repr(value)
+    return "a value of %d characters" % len(value)
 
 
 def decode_duration(value):
@@ -1020,6 +1044,10 @@ def describe(report):
     if report.failing:
         lines.append("VERDICT: %d finding(s) fail the gate, %d warning(s)."
                      % (len(report.failing), len(report.warnings)))
+    elif report.untold:
+        lines.append("VERDICT: no finding fails the gate, %d warning(s), but "
+                     "%d check(s) could not be made, so this is not a clean "
+                     "run." % (len(report.warnings), len(report.untold)))
     else:
         lines.append("VERDICT: no finding fails the gate, %d warning(s)."
                      % len(report.warnings))
@@ -1027,7 +1055,9 @@ def describe(report):
 
 
 def gate(report):
-    return 1 if report.failing else 0
+    if report.failing:
+        return 1
+    return 3 if report.untold else 0
 
 
 # --------------------------------------------------------------- self-test
@@ -1653,7 +1683,7 @@ def self_test():
           kinds(report.findings) == ["RUNNING_PAST_NORMAL"],
           "a running job is timed against the history's median")
     report = build_report([job()], activity=[act(90)])
-    check(kinds(report.findings) == ["NO_BASELINE"] and gate(report) == 0,
+    check(kinds(report.findings) == ["NO_BASELINE"] and gate(report) == 3,
           "activity without history has no median, and does not pass a "
           "running job as normal")
     lines = describe(build_report([job()], [step(1, fail=QUIT_SUCCESS),
@@ -1829,7 +1859,7 @@ def self_test():
           "a server with no operators flags every enabled job, and a "
           "header-only operators export is legitimate")
     report = build_report(four, notify=all_rows, operators=ops)
-    check(kinds(report.findings) == ["MAIL_UNCHECKED"] and gate(report) == 0
+    check(kinds(report.findings) == ["MAIL_UNCHECKED"] and gate(report) == 3
           and "no --mail export was given" in report.findings[0].text,
           "notify without --mail warns that mail was not checked, so a clean "
           "run does not claim more than it read")
@@ -1999,16 +2029,18 @@ def self_test():
                   "on_success_step_id,on_fail_action,on_fail_step_id,command"
                   "\n%s,one,x,1,0,2,0,\n" % j_load)
     code, _, err = run_cli(["--jobs", jobs_csv, "--steps", bad])
-    check(code == 2 and "line 2" in err and "step_id is 'one'" in err,
+    check(code == 2 and "line 2" in err and "step_id is a value of 3 characters"
+          in err and "'one'" not in err,
           "a step_id that is not a number exits 2 and names the line")
     bad = tmpfile("badid.csv", "job_id,name,start_step_id\nnot-a-guid,x,1\n")
     code, _, err = run_cli(["--jobs", bad, "--steps", steps_csv])
-    check(code == 2 and "'not-a-guid' is not a job id" in err and
-          "NOCOUNT" not in err, "a job_id that is not a GUID exits 2")
-    bad = tmpfile("nocol.csv", "job_id,title\n%s,x\n" % j_load)
+    check(code == 2 and "a value of 10 characters is not a job id" in err and
+          "not-a-guid" not in err and "NOCOUNT" not in err,
+          "a job_id that is not a GUID exits 2")
+    bad = tmpfile("nocol.csv", "job_id,step_id\n%s,x\n" % j_load)
     code, _, err = run_cli(["--jobs", bad, "--steps", steps_csv])
     check(code == 2 and "name, start_step_id" in err and
-          "It has: job_id, title." in err and "-y 0" not in err,
+          "It has: job_id, step_id." in err and "-y 0" not in err,
           "a missing column exits 2 and lists the columns there are")
     bad = tmpfile("line.csv", "line\n-----\njob_id,name,start_step_id,eol\n")
     code, _, err = run_cli(["--jobs", bad, "--steps", steps_csv])
@@ -2073,7 +2105,7 @@ def self_test():
     bare_hist = tmpfile("barehist.csv", "instance_id,job_id,step_id,"
                         "run_status,run_date,run_time,run_duration,eol\n")
     code, out, _ = run_cli(["--jobs", jobs_csv, "--history", bare_hist])
-    check(code == 0 and out.count("NO_BASELINE") == 3 and
+    check(code == 3 and out.count("NO_BASELINE") == 3 and
           "no finished run" in out,
           "a history export with no rows warns once for every job")
     code, out, _ = run_cli(["--jobs", jobs_csv, "--history", history_csv])
@@ -2379,10 +2411,35 @@ def self_test():
     old_shape = tmpfile("ra_old.csv", "platform,use_databasemail,"
                         "databasemail_profile\nWindows,1,\"Ops mail\"\n")
     code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", old_shape])
-    check(code == 0 and "WARN  MAIL_UNCHECKED" in out and
+    check(code == 3 and "WARN  MAIL_UNCHECKED" in out and
           "1 warning(s)" in out,
           "a mail export without the two check columns warns, and does not "
           "claim a clean result")
+    linux_mail = tmpfile("ra_linux.csv", "platform,use_databasemail,"
+                         "databasemail_profile\nLinux,0,\n")
+    code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", linux_mail])
+    check(code == 3 and "could not be made, so this is not a clean run."
+          in out and "no finding fails the gate, 1 warning(s), but" in out,
+          "a Linux mail export exits 3, not 0: the setting was not read  "
+          "<-- pinned defect")
+    hung_jobs = tmpfile("hung_jobs.csv", "job_id,name,start_step_id\n"
+                        "255df894-0012-4cd7-b944-52afb317e2a6,sf nightly,1\n")
+    hung_hist = tmpfile("hung_hist.csv", "instance_id,job_id,step_id,"
+                        "run_status,run_date,run_time,run_duration\n"
+                        "1,255df894-0012-4cd7-b944-52afb317e2a6,0,1,"
+                        "20261101,30000,100\n"
+                        "2,255df894-0012-4cd7-b944-52afb317e2a6,0,1,"
+                        "20261102,30000,100\n"
+                        "3,255df894-0012-4cd7-b944-52afb317e2a6,0,3,"
+                        "20261103,30000,400000\n")
+    code, out, _ = run_cli(["--jobs", hung_jobs, "--history", hung_hist])
+    check(code == 3 and "NO_BASELINE" in out and "FAR_PAST_NORMAL" not in out,
+          "a run of a job with too few runs to time exits 3, not 0  "
+          "<-- pinned defect")
+    report = build_report([job()], [step(1, fail=QUIT_SUCCESS), step(2)],
+                          activity=[act(90)])
+    check(gate(report) == 1 and report.untold,
+          "a failing finding still exits 1 when a check was also not made")
     bad_flag = tmpfile("ra_flag.csv",
                        mail_head + 'Windows,1,"Ops mail",2,1,$\n')
     code, _, err = run_cli(["--jobs", ra_jobs, "--mail", bad_flag])
@@ -2391,7 +2448,7 @@ def self_test():
     blank_checks = tmpfile("ra_blank.csv",
                            mail_head + 'Windows,1,"Ops mail",NULL,,$\n')
     code, out, _ = run_cli(["--jobs", ra_jobs, "--mail", blank_checks])
-    check(code == 0 and "WARN  MAIL_UNCHECKED" in out,
+    check(code == 3 and "WARN  MAIL_UNCHECKED" in out,
           "NULL or empty check columns read as unknown")
     steps_row = ('11111111-1111-1111-1111-111111111111,1,"load",1,0,2,0,'
                  '"sqlcmd -S srv -U sa -P Hunter2pass! -Q ""select 1""",$\n')
@@ -2402,6 +2459,67 @@ def self_test():
           and "<cell>" in err,
           "a steps export with no header row does not echo its first "
           "command to stderr  <-- pinned defect")
+    steps_head = ("job_id,step_id,step_name,on_success_action,"
+                  "on_success_step_id,on_fail_action,on_fail_step_id,"
+                  "command,eol\n")
+    guid = "11111111-1111-1111-1111-111111111111"
+    for label, text, column in (
+            ("an integer cell", guid + ',1,load,"sqlcmd -U sa -P Hunter2pass'
+             ' -Q x",1,0,2,0,$\n', "on_success_action"),
+            ("a job id cell", '"sqlcmd -S srv -U sa -P Hunter2",1,load,1,0,'
+             '2,0,x,$\n', "not a job id")):
+        shifted = tmpfile("ra_shift.csv", steps_head + text)
+        code, out, err = run_cli(["--jobs", ra_jobs, "--steps", shifted])
+        check(code == 2 and "line 2" in err and column in err and
+              "hunter2" not in err.lower() and "sqlcmd" not in err.lower()
+              and "a value of" in err,
+              "a command in %s is not copied into the error  "
+              "<-- pinned defect" % label)
+    ops_head = "id,name,enabled,email_address,pager_address,pager_days,eol\n"
+    shifted = tmpfile("ra_opshift.csv", ops_head + 'ops@example.invalid,'
+                      '"sf ops",1,"",0,0,$\n')
+    code, out, err = run_cli(["--jobs", ra_jobs, "--notify", ra_notify,
+                              "--operators", shifted])
+    check(code == 2 and "line 2" in err and "ops@example" not in err,
+          "an e-mail address in the id cell is not copied into the error  "
+          "<-- pinned defect")
+    check(show_cell("12") == "'12'" and show_cell("") == "''" and
+          show_cell("x" * 25) == "a value of 25 characters" and
+          show_cell("2026-11-10 01:02:03") == "'2026-11-10 01:02:03'" and
+          show_cell("Hunter2") == "a value of 7 characters" and
+          show_cell("-P Hunter2") == "a value of 10 characters" and
+          show_cell("a@b") == "a value of 3 characters",
+          "show_cell() quotes a number or a time and only counts the rest  "
+          "<-- pinned defect")
+    for label, text in (
+            ("a fragment of a command", guid + ',1,"load",-P Hunter2,0,2,0,'
+             '"cmd",$\n'),
+            ("a one-word password", guid + ',1,"load",Hunter2,0,2,0,"cmd",'
+             '$\n')):
+        shifted = tmpfile("ra_frag.csv", steps_head + text)
+        code, out, err = run_cli(["--jobs", ra_jobs, "--steps", shifted])
+        check(code == 2 and "line 2" in err and "hunter2" not in err.lower()
+              and "a value of" in err,
+              "%s in a number cell is not copied into the error  "
+              "<-- pinned defect" % label)
+    sel = tmpfile("ra_selhdr.csv", guid + ',1,"load",1,0,2,0,"select '
+                  'secretword from t",$\n')
+    code, out, err = run_cli(["--jobs", ra_jobs, "--steps", sel])
+    check(code == 2 and "secretword" not in err and "<cell>" in err,
+          "a command of lowercase words in the header row is not copied "
+          "into the error  <-- pinned defect")
+    rag_head = ("job_id,step_id,step_name,on_success_action,"
+                "on_success_step_id,on_fail_action,on_fail_step_id,command\n")
+    for label, text, cells in (
+            ("an unquoted comma in a command", guid + ',1,w,1,0,2,0,exec '
+             'sp_stop_job @x=1, @job_name = N\'Gone\'\n', "9 cells"),
+            ("a row one cell short", guid + ',1,w,1,0,2,0\n', "7 cells")):
+        ragged = tmpfile("ra_ragged.csv", rag_head + text)
+        code, out, err = run_cli(["--jobs", ra_jobs, "--steps", ragged])
+        check(code == 2 and "line 2" in err and cells in err and
+              "VERDICT" not in out,
+              "%s without an eol column exits 2, not 0  "
+              "<-- pinned defect" % label)
     wide = tmpfile("ra_wide.csv", ",".join("c%d" % n for n in range(20)) +
                    "\n")
     code, out, err = run_cli(["--jobs", ra_jobs, "--steps", wide])
@@ -2549,6 +2667,9 @@ def summary(passed, failed):
 
 # ----------------------------------------------------------------------- cli
 
+_KNOWN_HEADERS = frozenset(
+    [c for columns in COLUMNS.values() for c in columns] + ["eol", "line"])
+
 _GUID = re.compile(r"\A[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z", re.I)
 
 
@@ -2575,8 +2696,8 @@ def read_table(path, required):
         # --sql output unless -y 0 is given, and -y 0 also stops the cut.
         hint = " Run sqlcmd with -y 0." if header == ["line"] else ""
         # A file with no header row puts its first data row here, and a steps
-        # row holds a command. Name only cells that look like column names.
-        names = [h if re.match(r"^[a-z_ ]{1,32}$", h) else "<cell>"
+        # row holds a command. Name only cells that are a known column name.
+        names = [h if h in _KNOWN_HEADERS else "<cell>"
                  for h in header[:12]]
         if len(header) > 12:
             names.append("...")
@@ -2595,13 +2716,20 @@ def read_table(path, required):
         row.update(zip(header, cells))
         row["_line"] = line
         if "rows affected" in cells[0]:
-            raise ValueError("%s line %d: %s is a row count. Put SET NOCOUNT "
-                             "ON at the top of the query."
-                             % (path, line, clip(cells[0])))
+            raise ValueError("%s line %d: the row is a row count. Put SET "
+                             "NOCOUNT ON at the top of the query."
+                             % (path, line))
         if "eol" in header and row["eol"].strip() != "$":
             raise ValueError("%s line %d: the row is cut short. Run sqlcmd "
                              "with -y 0, or it cuts every long value at 256 "
                              "characters." % (path, line))
+        # zip() above drops an extra cell and pads a missing one, so a
+        # command cut at an unquoted comma would read as a whole row.
+        if len(cells) != len(header):
+            raise ValueError("%s line %d: the row has %d cells and the "
+                             "header has %d. A client that splits on a "
+                             "separator cannot write a correct CSV."
+                             % (path, line, len(cells), len(header)))
         rows.append(row)
     return rows
 
@@ -2614,15 +2742,15 @@ def _cell_int(row, column, path):
     # int() alone also reads 1_0 and digits from other scripts.
     if not _INT.match(value):
         raise ValueError("%s line %d: %s is %s, not a whole number"
-                         % (path, row["_line"], column, clip(value)))
+                         % (path, row["_line"], column, show_cell(value)))
     return int(value)
 
 
 def _cell_job(row, path):
     value = row["job_id"].strip()
     if not _GUID.match(value):
-        raise ValueError("%s line %d: %s is not a job id"
-                         % (path, row["_line"], clip(value)))
+        raise ValueError("%s line %d: a value of %d characters is not a job id"
+                         % (path, row["_line"], len(value)))
     return value
 
 
@@ -2637,7 +2765,7 @@ def _cell_time(row, column, path, required=False):
         return datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         raise ValueError("%s line %d: %s is %s, not YYYY-MM-DD HH:MM:SS"
-                         % (path, row["_line"], column, clip(value)))
+                         % (path, row["_line"], column, show_cell(value)))
 
 
 def load_jobs(path):

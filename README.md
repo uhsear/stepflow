@@ -51,7 +51,12 @@ PASS  a hand-written Windows mail row with a profile and use_databasemail 0 exit
 PASS  a mistyped profile name exits 1  <-- pinned defect
 PASS  database mail XPs off exits 1  <-- pinned defect
 ...
+PASS  a Linux mail export exits 3, not 0: the setting was not read  <-- pinned defect
+PASS  a run of a job with too few runs to time exits 3, not 0  <-- pinned defect
+...
 PASS  a steps export with no header row does not echo its first command to stderr  <-- pinned defect
+PASS  a command in an integer cell is not copied into the error  <-- pinned defect
+PASS  an e-mail address in the id cell is not copied into the error  <-- pinned defect
 ...
 PASS  the real exports: eight jobs tell nobody, and the run exits 1
 ...
@@ -88,10 +93,10 @@ PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  the footer counts a failure and exits 1 on it
 PASS  the file imports as a module without running main
 --------------------------------------------------------------------
-319 assertions, 0 failed
+331 assertions, 0 failed
 ```
 
-The full run prints all 319 assertions. Each `...` line marks a cut in this block.
+The full run prints all 331 assertions. Each `...` line marks a cut in this block.
 
 ## What already exists
 
@@ -125,18 +130,20 @@ with the operator row, so a disabled operator, a blank address or a level of "on
 counts as no notification. It also reads the Agent mail setting from an export, so it can still
 say that mail never sends.
 
-The name `stepflow` is also used by unrelated GitHub projects: a macro-step library, a workflow
-engine and an AWS Step Functions dashboard. None of them reads SQL Server Agent.
+The name `stepflow` is also used by unrelated GitHub projects, for example
+[JARMourato/StepFlow](https://github.com/JARMourato/StepFlow) (a stream of macro steps) and
+[hachreak/stepflow](https://github.com/hachreak/stepflow) (a streaming engine). Neither reads SQL
+Server Agent.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No database driver, no third-party package, no network.
 You run the SELECTs yourself with `sqlcmd` and give stepflow the CSV files.
 
-The same 319 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
+The same 331 assertions pass on Windows (Python 3.13.2), Ubuntu (Python 3.12.3) and Windows
 (Python 3.9.25). The three runs print the same text, except that Windows ends each line with
-CR LF. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1405
-statements, 348 branches). The code compiles with `python -W error` and passes `pyflakes`.
+CR LF. Branch coverage is 100 percent (`coverage run --branch stepflow.py --self-test`: 1453
+statements, 362 branches). The code compiles with `python -W error` and passes `pyflakes`.
 
 ```
 git clone https://github.com/uhsear/stepflow.git
@@ -150,13 +157,16 @@ git clone https://github.com/uhsear/stepflow.git
 
 **The steps export is as sensitive as `msdb`.** It holds the full text of every job step
 command, and CmdExec, SSIS and PowerShell steps often carry a password or a connection
-string (for example `sqlcmd -P`). stepflow never prints a command (an error names at most twelve
-header cells, and only a cell that looks like a column name), but the CSV file holds
-it. Keep `steps.csv` out of any repository and any ticket. `.gitignore` lists the file names
+string (for example `sqlcmd -P`). stepflow prints no step command text in an error (an error names at most twelve
+header cells, and only a cell that is a known column name, and it shows a rejected cell only
+when the cell holds nothing but digits and the signs of a number or a time). It does print
+a job or step name, and the job-name literal that a `DISARMED` or `NAME_BOUND` finding
+found in a command. The CSV file holds the whole command. Keep `steps.csv` out of any repository and any ticket. `.gitignore` lists the file names
 used here, but a different name is not covered. Delete the exports when the run is done.
 
 The operators export holds the e-mail and pager address of every operator. Treat it the same
-way. stepflow prints an operator name, never an address. No SELECT reads a password: `sp_get_sqlagent_properties` returns a `host_login_password`
+way. stepflow prints an operator name, never an address, and a rejected cell that holds an address
+is shown by its length only. No SELECT reads a password: `sp_get_sqlagent_properties` returns a `host_login_password`
 column, so the mail SELECT reads two registry values, one `msdb` table and one configuration row, and does not call it.
 
 ```
@@ -251,8 +261,8 @@ of the machine that runs stepflow.
 | `MAIL_NEVER_SENDS` | fail | The Agent mail setting cannot send. See "Failure alerts". |
 | `FAIL_CAN_END_GREEN` | warn | When this step fails, the job goes on to a step, and a path from there quits reporting success. |
 | `NAME_BOUND` | warn | A step command finds a job by its name. It works today, and a rename disarms it. |
-| `NO_BASELINE` | warn | Some runs were not timed, because the job has too few successful runs to take a median from, or the job has no finished run in the history export. |
-| `MAIL_UNCHECKED` | warn | The mail setting was not read: no `--mail` export, or the export came from SQL Server on Linux. |
+| `NO_BASELINE` | warn, exit 3 | Some runs were not timed, because the job has too few successful runs to take a median from, or the job has no finished run in the history export. |
+| `MAIL_UNCHECKED` | warn, exit 3 | The mail setting was not read: no `--mail` export, or the export came from SQL Server on Linux. |
 
 A step that never runs is reported once, as `UNREACHABLE`. Its own routes cannot fire, so they
 are not reported as well.
@@ -487,10 +497,15 @@ CRLF in it. The export kept all of it, and the job reference at its end was foun
 
 | Code | Meaning |
 |---|---|
-| 0 | No finding fails the gate. Warnings may be present. |
+| 0 | No finding fails the gate and every check ran. A `FAIL_CAN_END_GREEN` or `NAME_BOUND` warning may be present. |
 | 1 | At least one finding fails the gate. |
 | 2 | An export could not be read, is malformed, or disagrees with the jobs export, or `--report` could not be written. |
+| 3 | No finding fails the gate, but a check could not be made: a `NO_BASELINE` or `MAIL_UNCHECKED` warning is present. Read the `WARN` lines. |
 | 64 | Usage error, including an abbreviated flag such as `--ap`. |
+
+Exit 3 is not exit 0 on purpose. A run that could not time a hung run, or could not read the
+mail setting, did not find the job healthy, and a pipeline that tests for 0 must not read it as
+clean. Exit 1 wins over exit 3 when both apply.
 
 Exit 2 is not exit 1 on purpose. A scheduled check must not file "this export is broken" as "this
 job is broken". argparse exits 2 on a usage error by default, so stepflow moves its usage errors
@@ -534,11 +549,11 @@ Durations
 - It sees only the history that Agent has kept. Agent can be set to trim `sysjobhistory` by
   row count or by age.
 - A job with fewer than `--min-runs` other successful runs is never timed, only warned with
-  `NO_BASELINE`. A run that hung for many hours still exits 0 if its job has too few retained
-  successful runs. With `--activity` and no `--history`, every running job gets `NO_BASELINE`
-  and the run exits 0.
+  `NO_BASELINE`. A run that hung for many hours is not flagged if its job has too few retained
+  successful runs, and the run exits 3, not 0. With `--activity` and no `--history`, every
+  running job gets `NO_BASELINE` and the run exits 3.
 - An export that has a header and no rows is read as no data. A header-only jobs export or
-  activity export exits 2. A header-only history export warns `NO_BASELINE` for every job. A
+  activity export exits 2. A header-only history export warns `NO_BASELINE` for every job and exits 3. A
   header-only steps export reports `START_MISSING` for every job.
 - It reads `sysjobactivity` for the newest Agent session only. A run left open by an earlier
   session is not seen as running.
@@ -562,26 +577,53 @@ Exports and output
   which is refused. It does not ask first.
 - A job or step name that the output code page cannot encode prints with a `?`, so the report
   does not crash. Set `PYTHONUTF8=1` to print it whole.
-- An error message that quotes a cell cuts it to 32 characters, and the header list of an error
-  names only cells that look like column names, so a shifted column or a file with no header
-  row does not copy a step command into a log. A shifted column can still put 28 characters of
-  a command on stderr. The cut is a safeguard, not a guarantee. Treat the exports and
-  the report as sensitive.
-- A job or step name that holds a line break or a terminal escape code prints as it is. Read the
-  last `VERDICT` line, not the first.
+- An error message that names a rejected cell shows its text only when the cell is at most 24
+  characters and holds only digits, space and `+ - . :`. Any other cell, such as a command, a
+  password or an e-mail address that a shifted column put there, is shown by its length. A job id
+  cell is always shown by its length. The header list of an error names only cells that are a
+  known column name, and shows `<cell>` for any other. A password that is only digits, in a
+  shifted number column, is still shown. Treat the exports and the report as sensitive.
+- A row whose cell count differs from the header exits 2, whatever the cause. The usual cause is
+  an unquoted comma in a step command, written by a client that splits on a separator.
+- A job or step name that holds a line break or a terminal escape code prints as it is, so a
+  name can make the report misleading, and it can forge a line such as a `VERDICT` line. Read
+  the exit code, not only the text.
+- A step command with tens of thousands of consecutive bracketed identifiers can make the job
+  reference scan very slow.
 - The check that `--report` does not name an input compares paths, not files, so a symlink or
   hard link to an export is not caught.
-- A reader that quits early (`| head -1`) ends the output without a traceback. The exit code
-  is still the gate result, but the shell reports the code of the last command in the pipe.
+- A reader that quits early (`| head -1`) ends the report output without a traceback. The exit
+  code is still the gate result, but the shell reports the code of the last command in the pipe.
+  A reader that quits early on `--self-test` output prints a traceback; only the report path is
+  guarded.
+- A step command with many hundreds of `NOT EXISTS` lookups of `sysjobs` makes the job
+  reference scan take seconds (1,300 lookups in a 99,000 character command took 5 seconds). A
+  `LIKE` pattern with more than a handful of `%` wildcards can make the match against a job name
+  very slow (8 wildcards against a 40 character name took 3.7 seconds).
+- A bare `name = 'x'` in a command that also reads `sysjobs` can belong to another table, such
+  as `UPDATE dbo.cfg SET name = 'x'`. It can give a false `DISARMED`, and it prints that literal.
+- Do not open the exports in a spreadsheet. A job or step name that starts with `=`, `+`, `-`
+  or `@` is written by `sqlcmd` without a guard, so a spreadsheet can run it as a formula.
+- `--report` with `--apply` truncates the report file before it writes it, so a write that fails
+  halfway leaves a partial file and the earlier report is lost.
+- The self-test source holds fake passwords on purpose, such as `-P Hunter2pass!` in a fixture
+  command, to prove that no error prints them. A secret scanner can flag them.
 
 Failure alerts
 - The step, history and activity run shown above came from exports that are not shipped, so a
   reader cannot repeat it. The self-test pins each check on synthetic rows instead.
+- The container run behind "What SQL Server Agent does" is not kept in this repository, so a
+  reader cannot repeat it from here.
 - The behaviour table was run on build 16.0.4295.3, and the mail checks on 16.0.4315.2
-  (CU27-GDR).
+  (CU27-GDR). Those are two builds of SQL Server 2022 CU27, not one.
+- The Windows registry read, and a profile that exists, were not run against a real Windows SQL
+  Server.
+- The hand-written row for a Linux server (see the mail check above) is not pinned by the
+  self-test.
 - The statement that `@email_profile` stores nothing rests on SQL Server 2022 CU27 only. Older
-  builds were not read, and Microsoft's page for `sp_set_sqlagent_properties` was not
-  available to cite.
+  builds were not read, and Microsoft Learn has no page for `sp_set_sqlagent_properties` (the
+  `sp-set-sqlagent-properties-transact-sql` address returned HTTP 404 on 2026-11-10), so the claim rests on
+  the procedure text.
 - A mail export from an older stepflow has no `profile_exists` and `database_mail_xps` columns.
   It gets `MAIL_UNCHECKED` for a Windows profile, not a clean result. The mail check never
   tests that the profile has an account, that the mail server answers, or that a message can
@@ -593,9 +635,9 @@ Failure alerts
   profile cell of the text `NULL` is read as a profile named NULL.
 - A server that sends all its mail from job steps, and never through Agent notification, still
   gets `MAIL_NEVER_SENDS` when Agent mail is off.
-- Without `--mail`, a run with no `NO_FAILURE_ALERT` finding exits 0 and only warns that the mail
-  setting was not read. A Linux export is the same: `MAIL_UNCHECKED` exits 0. A scheduled check
-  that watches only the exit code passes these runs, so it must also read the `WARN` lines.
+- Without `--mail`, a run with no `NO_FAILURE_ALERT` finding warns that the mail setting was not
+  read, and exits 3. A Linux export is the same: `MAIL_UNCHECKED` exits 3. A check that treats
+  only 1 as failure passes these runs, so it must also read the `WARN` lines.
 - The `net send` wording of a finding can name net send when only an operator id is set, and
   the level is 0. The verdict is still right.
 - It reads only the notify settings of the job itself. A job whose own step sends the mail (a
@@ -605,6 +647,10 @@ Failure alerts
   either. There is no allow list: filter the job out of the jobs and notify exports together.
 - A job that no operator hears is flagged even when you chose that, such as a job of the Report
   Server category (100). sp_Blitz skips that category. stepflow does not read the category.
+  A stock maintenance job that nobody was meant to alert on, such as `syspolicy_purge_history`,
+  is flagged like any other, so filter it out of the jobs and notify exports together.
+- An operator whose e-mail address is present but malformed counts as reachable, because
+  stepflow tests only that the address is not empty.
 - `pager_days` is a bitmask of the days an operator takes pages. stepflow tests only that it is
   not 0. It does not read the pager start and end times, so a page can still fall outside them.
 - The `use_databasemail` and profile values are the stored setting. An Agent that was not
@@ -612,7 +658,7 @@ Failure alerts
 - The Windows branch of the `mail` SELECT was not run: no Windows SQL Server was available. Its
   registry key comes from the text of `sp_set_sqlagent_properties`. Azure SQL Managed Instance, which fixes its own profile
   name, was not tested.
-- A Linux server is `MAIL_UNCHECKED`, a warning that exits 0. The run cannot tell a working
+- A Linux server is `MAIL_UNCHECKED`, a warning that exits 3. The run cannot tell a working
   Linux Agent from a broken one.
 - `notify_level_eventlog` (the Windows event log) is not read, because a log line tells no one.
 
