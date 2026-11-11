@@ -157,7 +157,7 @@ git clone https://github.com/uhsear/stepflow.git
 ## Usage
 
 1. Print each SELECT into a file.
-2. Run each file with `sqlcmd` against `msdb`, with `-h -1` and `-y 0`. Add your own connection options. Use `-E`, or set `SQLCMDPASSWORD` in the environment. Never type `-P` on the command line, because it shows the password in process lists and shell history.
+2. Run each file with `sqlcmd` against `msdb`, with `-y 0`. Do not add `-h`. Add your own connection options. Use `-E`, or set `SQLCMDPASSWORD` in the environment. Never type `-P` on the command line, because it shows the password in process lists and shell history.
 3. Give stepflow the CSV files.
 
 **The steps export is as sensitive as `msdb`.** It holds the full text of every job step
@@ -183,7 +183,7 @@ python stepflow.py --sql notify > notify.sql
 python stepflow.py --sql operators > operators.sql
 python stepflow.py --sql mail > mail.sql
 
-sqlcmd -S <server> -d msdb -h -1 -y 0 -f o:65001 -i steps.sql -o steps.csv
+sqlcmd -S <server> -d msdb -y 0 -f o:65001 -i steps.sql -o steps.csv
 
 python stepflow.py --jobs jobs.csv --steps steps.csv
 python stepflow.py --jobs jobs.csv --history history.csv --activity activity.csv
@@ -215,26 +215,28 @@ Give `--jobs` and at least one other export (`--notify` and `--operators` count 
 is not in the jobs export exits 2. A notify export must have a row for every job in the jobs
 export, so a job created or deleted between the two exports exits 2.
 
-### The SQL, and why `-h -1` and `-y 0`
+### The SQL, and why `-y 0`
 
 Each SELECT builds its CSV line in T-SQL: it quotes every name and command and doubles every
 quote inside them. A job step command holds commas, quotes and line breaks, so a client that
 splits on a separator cannot produce a correct CSV. Each line ends in an `eol` column that is
 always `$`.
 
-Two `sqlcmd` flags matter, and they do different jobs. Microsoft documents `-h` as the
-number of rows between column headings: the default prints the headings once for each set of
-results, and `-1` prints none. Without `-h -1`, `sqlcmd` writes the column name `line` and a
-row of dashes above the data, and stepflow exits 2 and names `-h -1`. Microsoft documents `-y`
-as the limit on large variable length types: the default is 256, and `0` removes the limit.
-Without `-y 0`, `sqlcmd` cuts every `nvarchar(max)` value at 256 characters. The cut loses
-the closing quote and the `eol` column, and stepflow exits 2 with the line where the cut row
-starts and names `-y 0`. `-y` does not touch the headings.
+One `sqlcmd` flag matters: `-y 0`. Microsoft documents `-y` as the limit on large variable
+length types: the default is 256, and `0` removes the limit. Without `-y 0`, `sqlcmd` cuts
+every `nvarchar(max)` value at 256 characters. The cut loses the closing quote and the `eol`
+column, and stepflow exits 2 with the line where the cut row starts and names `-y 0`.
+
+On the build tested (`sqlcmd` 18.7.0001.1 on Linux), `-y 0` also drops the `line` heading and
+the row of dashes, and `-h -1` together with `-y 0` is refused with "The -h and the -y 0
+options are mutually exclusive". No rows are written, and stepflow exits 2 on an empty file.
+`-h -1` alone leaves rows padded with trailing spaces and cuts long values at 256. So use
+`-y 0` and no `-h`. Windows `sqlcmd` and the Go `sqlcmd` were not tested.
 
 | Client behaviour | What stepflow does |
 |---|---|
-| `-h -1` missing | Exits 2 on the `line` heading, and the message names `-h -1`. |
-| `-y 0` missing | Exits 2, and the message names `-y 0`. |
+| `-y 0` missing, with the `line` heading | Exits 2 on the `line` heading, and the message names `-y 0` and says to leave out `-h`. |
+| `-y 0` missing, rows cut | Exits 2, and the message names `-y 0`. |
 | `SET NOCOUNT ON` removed from the query | Exits 2 on the `(N rows affected)` line, and names `SET NOCOUNT ON`. |
 | `-u` (UTF-16 output) | Reads the file the same as UTF-8. |
 | A Windows PowerShell 5.1 `>` redirect (UTF-16) | Reads the file the same as UTF-8. |
@@ -578,9 +580,9 @@ Durations
 - Times are the server's own clock throughout. stepflow does no time zone conversion.
 
 Exports and output
-- The `-h -1` behaviour comes from the Microsoft `sqlcmd` page. The container exports above
-  were taken with `-y 0 -f o:65001`, and the `-h -1` command line was not run against a real
-  `sqlcmd`, because there is none on the machine that built this tool.
+- The `sqlcmd` flags were checked against `sqlcmd` 18.7.0001.1 on Linux (SQL Server 2022
+  16.0.4315.2): `-y 0 -f o:65001` works, and `-h -1 -y 0` is refused. The earlier exports in
+  this README were taken with `sqlcmd` 18.6 and the same flags. Windows `sqlcmd` was not run.
 - The SELECTs use `CONCAT`, so they need SQL Server 2012 or newer. They were run on SQL Server
   2022 only.
 - The comment and string cutter handles single-quoted literals, `--` comments and `/* */`
