@@ -647,6 +647,21 @@ Exports and output
   when it belongs to another table, such as `UPDATE dbo.cfg SET name = 'x'`. It can give a
   false `DISARMED`, and it prints that literal. Two joined tables that both have a `name`
   column make T-SQL refuse a bare `name`, so a working step does not hit that case.
+- The `sysjobs` test covers the whole step command, not one statement. A `name = 'x'` on another
+  table in a later statement of the same command is read as a job name. It can give a false
+  `DISARMED`, and it prints that literal.
+- One `LIKE` pattern in a step command that stepflow cannot parse (such as `[z-a]`) stops the run
+  with exit 2, so no other finding is shown.
+- With `--apply`, a report file that cannot be written (a missing folder, or a directory path)
+  exits 2 after the findings were printed. A failed gate then shows exit 2, not 1.
+- If stdout cannot be written for a reason other than a closed pipe, such as a full disk, the run
+  ends with a traceback and exit 1, not exit 2.
+- The self-test imports the file as the module `stepflow`, so keep the file name `stepflow.py`
+  when you run `--self-test`. A renamed copy ends in a `ModuleNotFoundError` traceback with exit 1.
+- The measured `sqlcmd` text says `-y` defaults to 256 and warns to use `-y 0` with great care. It
+  does not say that 0 means no limit. That behaviour rests on the test above, not on the page.
+- Branch coverage and `pyflakes` were measured on Windows only. Linux ran the self-test, and
+  `coverage` and `pyflakes` were not installed there.
 - Do not open the exports in a spreadsheet. A job or step name that starts with `=`, `+`, `-`
   or `@` is written by `sqlcmd` without a guard, so a spreadsheet can run it as a formula.
 - `--report` with `--apply` truncates the report file before it writes it, so a write that fails
@@ -695,6 +710,12 @@ Failure alerts
   Server category (100). sp_Blitz skips that category. stepflow does not read the category.
   A stock maintenance job that nobody was meant to alert on, such as `syspolicy_purge_history`,
   is flagged like any other, so filter it out of the jobs and notify exports together.
+- The failsafe operator is not read. It receives Agent alert notifications, not job completion
+  notifications, so a job with no operator is still flagged `NO_FAILURE_ALERT` when a failsafe
+  operator is set.
+- Operator names are printed as stored. An operator named as an e-mail address appears in full.
+- The platform is read from `@@VERSION`, so an Azure SQL Managed Instance row would read as
+  Windows.
 - An operator whose e-mail address is present but malformed counts as reachable, because
   stepflow tests only that the address is not empty.
 - `pager_days` is a bitmask of the days an operator takes pages. stepflow tests only that it is
